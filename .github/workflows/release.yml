@@ -1,0 +1,66 @@
+name: Test and release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Compile
+        run: python -m compileall -q app.py oem_mcp_client scripts tests
+      - name: Lint Python
+        run: python -m ruff check .
+      - name: Lint shell
+        run: shellcheck scripts/*.sh
+      - name: Test
+        run: python -m pytest -q --cov=oem_mcp_client --cov=scripts.release_notes --cov-report=term-missing
+      - name: Audit direct runtime dependencies
+        run: python -m pip_audit -r requirements.txt
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build title and notes from newest changelog section
+        env:
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          python scripts/release_notes.py \
+            --short-sha "${SHORT_SHA:0:12}" \
+            --title-file release-title.txt \
+            --notes-file release-notes.md
+      - name: Create exactly one commit-derived release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: commit-${{ github.sha }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to create."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "$(cat release-title.txt)" \
+            --notes-file release-notes.md

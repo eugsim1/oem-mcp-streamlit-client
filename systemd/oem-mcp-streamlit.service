@@ -1,0 +1,35 @@
+[Unit]
+Description=OEM MCP Streamlit Client
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+WorkingDirectory=@@INSTALL_DIR@@
+EnvironmentFile=@@ENV_FILE@@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@@VENV_DIR@@/bin/streamlit run @@INSTALL_DIR@@/app.py --server.address=@@ADDRESS@@ --server.port=@@PORT@@ --server.headless=true --browser.gatherUsageStats=false
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+
+# Defense in depth. The application only needs its configured data and log paths.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=@@DATA_DIR@@ @@LOG_DIR@@
+
+[Install]
+WantedBy=multi-user.target
