@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 - 2026-08-27
+
+- Add `location.md` with the sanitized absolute local source path and private repository URL.
+
 ## 0.1.0 - 2026-08-27
 
 - Add the Streamlit connection, capabilities, request, metrics, relationship, history/log, and diagnostics interfaces.
