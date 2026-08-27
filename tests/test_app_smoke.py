@@ -11,6 +11,22 @@ def test_streamlit_app_renders_all_primary_tabs(tmp_path: Path, monkeypatch) -> 
     app = AppTest.from_file(str(app_path)).run(timeout=30)
     assert not app.exception
     labels = [tab.label for tab in app.tabs]
-    for required in ("Connection", "Capabilities", "Request", "Metrics", "History & logs", "Diagnostics"):
+    for required in (
+        "Connection",
+        "Capabilities",
+        "Request",
+        "Metrics",
+        "Operations",
+        "Workspace",
+        "Topology",
+        "SQL",
+        "Incidents",
+        "Assistant",
+        "Governance",
+        "Automation",
+        "Usage & cost",
+        "History & logs",
+        "Diagnostics",
+    ):
         assert required in labels
     assert "Host ↔ database associations" in labels

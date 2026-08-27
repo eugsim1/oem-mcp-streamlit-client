@@ -1,0 +1,30 @@
+{
+  "rules": [
+    {
+      "name": "deny-destructive",
+      "roles": ["*"],
+      "tools": ["Delete*", "Remove*", "Drop*"],
+      "targets": ["*"],
+      "effect": "deny",
+      "reason": "Destructive operations are not permitted from the GUI."
+    },
+    {
+      "name": "operators-read-only",
+      "roles": ["operator", "senior-operator", "approver"],
+      "tools": ["Get*", "List*", "Show*", "Read*", "Query*", "ExecuteSql"],
+      "targets": ["*"],
+      "effect": "allow",
+      "requireApproval": false,
+      "reason": "Read-only operations are allowed for operators."
+    },
+    {
+      "name": "controlled-change",
+      "roles": ["senior-operator"],
+      "tools": ["Acknowledge*", "Assign*", "Suppress*"],
+      "targets": ["prod-*", "production-*"],
+      "effect": "allow",
+      "requireApproval": true,
+      "reason": "Production state changes require a second operator approval."
+    }
+  ]
+}

@@ -81,6 +81,17 @@ def is_read_only_sql(sql: str) -> bool:
     return len(statements) == 1
 
 
+def bounded_read_only_sql(sql: str, row_limit: int = 500) -> str:
+    """Validate a query and append an Oracle row limit when one is absent."""
+    if not is_read_only_sql(sql):
+        raise ToolSafetyError("SQL workbench accepts one read-only SELECT/WITH statement.")
+    limit = max(1, min(int(row_limit), 10_000))
+    clean = sql.strip().rstrip(";")
+    if re.search(r"\b(fetch\s+(?:first|next)|rownum\s*(?:<|<=|=)|offset\s+\d+)\b", clean, re.I):
+        return clean
+    return f"{clean}\nFETCH FIRST {limit} ROWS ONLY"
+
+
 def _sql_values(value: Any, parent_key: str = "") -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):

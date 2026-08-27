@@ -4,18 +4,33 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from oem_mcp_client.advanced_ui import (
+    render_assistant,
+    render_automation,
+    render_governance,
+    render_incidents,
+    render_operations,
+    render_sql,
+    render_topology,
+    render_usage,
+    render_workspace,
+)
 from oem_mcp_client.client import McpClientError, OemMcpClient
 from oem_mcp_client.config import SUPPORTED_PROTOCOLS, ConnectionConfig, ProfileStore, runtime_paths, safe_endpoint
 from oem_mcp_client.history import HistoryStore
+from oem_mcp_client.jobs import BackgroundJobManager
 from oem_mcp_client.logging_setup import configure_logging, tail_log
 from oem_mcp_client.metrics import candidate_tools, collect_local_metrics
+from oem_mcp_client.policy import PolicyEngine
 from oem_mcp_client.safety import ToolSafetyError, redact, risk_label, validate_tool_call
 from oem_mcp_client.ui_helpers import render_tool_result, schema_arguments, tool_table
+from oem_mcp_client.workspace import WorkspaceStore
 
 st.set_page_config(page_title="OEM MCP Client", page_icon="🔗", layout="wide")
 
@@ -24,7 +39,14 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH = configure_logging(LOG_DIR)
 LOGGER = logging.getLogger("oem_mcp_client.app")
 HISTORY = HistoryStore(DATA_DIR / "history.sqlite3")
+WORKSPACE = WorkspaceStore(DATA_DIR / "workspace.sqlite3")
 PROFILES = ProfileStore(PROFILE_FILE)
+try:
+    POLICY = PolicyEngine.from_file(os.getenv("OEM_MCP_POLICY_FILE") or None)
+    POLICY_ERROR = ""
+except ValueError as exc:
+    POLICY = PolicyEngine()
+    POLICY_ERROR = str(exc)
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -49,9 +71,14 @@ DEFAULTS = {
     "last_result": None,
     "last_metric_host": None,
     "last_metric_database": None,
+    "operator_id": os.getenv("OEM_MCP_OPERATOR_ID", "operator"),
+    "operator_role": os.getenv("OEM_MCP_OPERATOR_ROLE", "operator"),
 }
 for state_key, default_value in DEFAULTS.items():
     st.session_state.setdefault(state_key, default_value)
+if "job_manager" not in st.session_state:
+    st.session_state["job_manager"] = BackgroundJobManager(WORKSPACE, max_workers=int(os.getenv("OEM_MCP_JOB_WORKERS", "2")))
+JOBS: BackgroundJobManager = st.session_state["job_manager"]
 
 
 def active_client() -> OemMcpClient | None:
@@ -80,50 +107,116 @@ def record_failure(config: ConnectionConfig, event: str, exc: Exception, elapsed
     )
 
 
-def execute_tool(tool: dict[str, Any], arguments: dict[str, Any], *, context: str) -> dict[str, Any] | None:
-    client = active_client()
-    if not client:
-        st.error("Connect and initialize the OEM MCP session first.")
-        return None
+def authorized_call_with_client(
+    client: OemMcpClient,
+    operator_role: str,
+    tool: dict[str, Any],
+    arguments: dict[str, Any],
+    *,
+    context: str,
+) -> dict[str, Any]:
+    start = time.monotonic()
     try:
+        decision = POLICY.evaluate(operator_role, tool, arguments)
+        if not decision.allowed:
+            raise ToolSafetyError(f"Policy denied the request ({decision.matched_rule}): {decision.reason}")
+        if decision.requires_approval and not WORKSPACE.has_valid_approval(
+            client.config.endpoint, str(tool.get("name", "")), arguments
+        ):
+            raise ToolSafetyError("This request requires an unexpired approval from a different operator. Create it in Governance.")
         validate_tool_call(
             tool,
             arguments,
             allow_mutating=env_flag("OEM_MCP_ALLOW_MUTATING_TOOLS"),
             allow_nonselect_sql=env_flag("OEM_MCP_ALLOW_NONSELECT_SQL"),
         )
-        start = time.monotonic()
         result = client.call_tool(str(tool.get("name", "")), arguments)
+    except (McpClientError, ToolSafetyError, ValueError) as exc:
         elapsed_ms = round((time.monotonic() - start) * 1000)
         HISTORY.record_execution(
             endpoint=client.config.endpoint,
             tool_name=str(tool.get("name", "")),
-            status="success" if not result.get("isError") else "tool-error",
+            status="error",
             latency_ms=elapsed_ms,
             arguments=arguments,
-            message=f"context={context}",
+            message=f"context={context};error={type(exc).__name__}",
         )
-        LOGGER.info(
-            "Tool call completed name=%s context=%s elapsed_ms=%s is_error=%s",
-            tool.get("name"),
-            context,
-            elapsed_ms,
-            bool(result.get("isError")),
-        )
-        return result
-    except (McpClientError, ToolSafetyError, ValueError) as exc:
-        timing = client.last_timing.elapsed_ms if client.last_timing else None
-        HISTORY.record_execution(
-            endpoint=client.config.endpoint,
-            tool_name=str(tool.get("name", "")),
+        WORKSPACE.record_usage(
+            category="mcp",
+            operation=str(tool.get("name", "")),
+            provider="oracle-enterprise-manager",
+            latency_ms=elapsed_ms,
             status="error",
-            latency_ms=timing,
-            arguments=arguments,
-            message=type(exc).__name__,
+            context=context,
         )
+        raise
+    elapsed_ms = round((time.monotonic() - start) * 1000)
+    HISTORY.record_execution(
+        endpoint=client.config.endpoint,
+        tool_name=str(tool.get("name", "")),
+        status="success" if not result.get("isError") else "tool-error",
+        latency_ms=elapsed_ms,
+        arguments=arguments,
+        message=f"context={context};policy={decision.matched_rule}",
+    )
+    WORKSPACE.record_usage(
+        category="mcp",
+        operation=str(tool.get("name", "")),
+        provider="oracle-enterprise-manager",
+        latency_ms=elapsed_ms,
+        status="success" if not result.get("isError") else "tool-error",
+        context=context,
+    )
+    LOGGER.info(
+        "Tool call completed name=%s context=%s elapsed_ms=%s is_error=%s policy=%s",
+        tool.get("name"),
+        context,
+        elapsed_ms,
+        bool(result.get("isError")),
+        decision.matched_rule,
+    )
+    return result
+
+
+def authorized_call(tool: dict[str, Any], arguments: dict[str, Any], *, context: str) -> dict[str, Any]:
+    client = active_client()
+    if not client:
+        raise McpClientError("Connect and initialize the OEM MCP session first.")
+    return authorized_call_with_client(
+        client,
+        str(st.session_state.get("operator_role", "operator")),
+        tool,
+        arguments,
+        context=context,
+    )
+
+
+def execute_tool(tool: dict[str, Any], arguments: dict[str, Any], *, context: str) -> dict[str, Any] | None:
+    try:
+        return authorized_call(tool, arguments, context=context)
+    except (McpClientError, ToolSafetyError, ValueError) as exc:
         LOGGER.warning("Tool call rejected or failed name=%s context=%s type=%s", tool.get("name"), context, type(exc).__name__)
         st.error(str(exc))
         return None
+
+
+def advanced_execute(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any] | None:
+    result = execute_tool(tool, arguments, context="advanced-tab")
+    if result is not None:
+        st.session_state["last_result"] = result
+    return result
+
+
+def background_execute(tool: dict[str, Any], arguments: dict[str, Any], context: str) -> Callable[[], dict[str, Any]]:
+    captured_client = active_client()
+    captured_role = str(st.session_state.get("operator_role", "operator"))
+
+    def run() -> dict[str, Any]:
+        if not captured_client:
+            raise McpClientError("The OEM MCP session was not available when this job was queued.")
+        return authorized_call_with_client(captured_client, captured_role, tool, arguments, context=context)
+
+    return run
 
 
 def render_metric_tool(domain: str, title: str) -> None:
@@ -188,8 +281,40 @@ with st.sidebar:
         "[Oracle OEM MCP documentation](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emadm/enterprise-manager-model-context-protocol-server.html)"
     )
 
-connection_tab, capabilities_tab, request_tab, metrics_tab, history_tab, diagnostics_tab = st.tabs(
-    ["Connection", "Capabilities", "Request", "Metrics", "History & logs", "Diagnostics"]
+(
+    connection_tab,
+    capabilities_tab,
+    request_tab,
+    metrics_tab,
+    operations_tab,
+    workspace_tab,
+    topology_tab,
+    sql_tab,
+    incidents_tab,
+    assistant_tab,
+    governance_tab,
+    automation_tab,
+    usage_tab,
+    history_tab,
+    diagnostics_tab,
+) = st.tabs(
+    [
+        "Connection",
+        "Capabilities",
+        "Request",
+        "Metrics",
+        "Operations",
+        "Workspace",
+        "Topology",
+        "SQL",
+        "Incidents",
+        "Assistant",
+        "Governance",
+        "Automation",
+        "Usage & cost",
+        "History & logs",
+        "Diagnostics",
+    ]
 )
 
 with connection_tab:
@@ -431,6 +556,40 @@ with metrics_tab:
         else:
             render_metric_tool("association", "OEM host-to-database relationships")
 
+with operations_tab:
+    render_operations(discovery(), advanced_execute, WORKSPACE)
+
+with workspace_tab:
+    render_workspace(discovery(), WORKSPACE, PROFILES)
+
+with topology_tab:
+    render_topology(discovery(), advanced_execute)
+
+with sql_tab:
+    render_sql(discovery(), advanced_execute, WORKSPACE)
+
+with incidents_tab:
+    render_incidents(WORKSPACE)
+
+with assistant_tab:
+    render_assistant(discovery(), advanced_execute, WORKSPACE)
+
+with governance_tab:
+    if POLICY_ERROR:
+        st.error(f"Policy configuration error; built-in read-only policy is active: {POLICY_ERROR}")
+    render_governance(
+        discovery(),
+        WORKSPACE,
+        POLICY,
+        active_client().config.endpoint if active_client() else "https://not-connected.invalid/em/api/mcp",
+    )
+
+with automation_tab:
+    render_automation(discovery(), WORKSPACE, JOBS, background_execute)
+
+with usage_tab:
+    render_usage(WORKSPACE)
+
 with history_tab:
     st.subheader("Connection and execution history")
     limit = st.selectbox("Rows", [50, 100, 200, 500], index=2)
@@ -472,6 +631,11 @@ with diagnostics_tab:
         "allow_mutating_tools": env_flag("OEM_MCP_ALLOW_MUTATING_TOOLS"),
         "allow_nonselect_sql": env_flag("OEM_MCP_ALLOW_NONSELECT_SQL"),
         "reverse_proxy_authenticated": env_flag("OEM_MCP_REVERSE_PROXY_AUTHENTICATED"),
+        "policy_file": os.getenv("OEM_MCP_POLICY_FILE", "built-in read-only"),
+        "operator_role": st.session_state.get("operator_role"),
+        "workspace_database": str(DATA_DIR / "workspace.sqlite3"),
+        "background_workers": int(os.getenv("OEM_MCP_JOB_WORKERS", "2")),
+        "oci_genai_configured": bool(os.getenv("OCI_GENAI_OPENAI_ENDPOINT") and os.getenv("OCI_GENAI_MODEL")),
     }
     st.json(redact(diagnostic))
     if st.button("Send MCP ping", disabled=not bool(client)):

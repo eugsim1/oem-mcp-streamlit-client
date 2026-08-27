@@ -4,16 +4,57 @@ A security-conscious Streamlit GUI for connecting to the Oracle Enterprise Manag
 
 The client implements Oracle's HTTP/JSON-RPC transport directly. It does not require an LLM, an external AI service, or an MCP proxy.
 
+## OCI reference architecture and design
+
+![OEM MCP Streamlit Client OCI reference architecture](docs/architecture/oem-mcp-streamlit-oci-architecture.svg)
+
+The reference deployment uses an OCI private application subnet, Oracle Linux 8 Compute, block-volume-backed local state, and a private path to the OEM managed estate. OCI Load Balancer, Vault, Generative AI, Logging, Monitoring, Notifications, Object Storage, and DRG/VPN/FastConnect are shown as optional integrations. The editable source uses official Oracle OCI Architecture Diagram Toolkit v24.2 stencils.
+
+- [Editable draw.io architecture](docs/architecture/oem-mcp-streamlit-oci-architecture.drawio)
+- [SVG architecture render](docs/architecture/oem-mcp-streamlit-oci-architecture.svg)
+- [PNG architecture render](docs/architecture/oem-mcp-streamlit-oci-architecture.png)
+- [Software Solution Design (DOCX)](docs/architecture/oem-mcp-streamlit-software-solution-design.docx)
+- [Software Solution Design (PDF)](docs/architecture/oem-mcp-streamlit-software-solution-design.pdf)
+- [Architecture artifact notes](docs/architecture/README.md)
+
 ## What the GUI provides
 
 - **Connection** — OEM endpoint, username, password, protocol version, request timeout, TLS verification, custom CA bundle, and reusable non-secret profiles.
 - **Capabilities** — initializes MCP and retrieves all advertised tools, prompts, resources, and resource templates, including pagination and input schemas.
 - **Request** — builds an input form from the selected tool's JSON Schema, requires confirmation, validates the input, invokes `tools/call`, and renders structured results.
 - **Metrics** — shows the Streamlit Linux server's CPU/load, memory, disk, network, and process metrics. It also ranks authorized OEM tools for Linux targets, databases, and host-to-database relationships.
+- **Operations** — refreshes local Linux health, identifies likely OEM metric tools, charts live records, and saves redacted dashboard snapshots.
+- **Workspace** — persists named dashboards, runbooks, and read-only SQL queries in a local SQLite workspace.
+- **Topology** — invokes a discovered association operation and infers a Graphviz node/edge view while keeping the source result available for verification.
+- **SQL** — exposes only a discovered `ExecuteSql` operation, validates a single `SELECT`/`WITH`, and automatically applies a configurable row cap.
+- **Incidents** — creates local triage cases with severity, status, filtered evidence, and an append-only timestamped timeline.
+- **Assistant** — proposes one discovered tool using a deterministic local planner or an optional OCI Generative AI OpenAI-compatible endpoint; execution remains a separate reviewed action.
+- **Governance** — evaluates deny-first role/tool/target policy rules and supports expiring two-person approvals bound to the exact request hash.
+- **Automation** — runs bounded background jobs, queues due read-only schedules during an active authenticated session, creates downloadable reports, and records local alerts.
+- **Usage & cost** — records MCP/AI latency, status, token counts, configured cost estimates, and CSV exports.
 - **History & logs** — timestamped connection and execution history in SQLite, JSON downloads, and a rotating application log.
 - **Diagnostics** — negotiated protocol/server details, safe configuration state, MCP ping, and redacted diagnostic export.
 
 OEM returns operations according to the account's privileges. The GUI discovers that surface at connection time instead of assuming fixed tool names. Oracle currently documents tools as the primary server feature; prompts, resources, and resource templates may be empty, but the client requests and displays all four capability types.
+
+## Implemented priorities
+
+| Priority | Capability | GUI |
+| ---: | --- | --- |
+| 2 | Live operations dashboard | Operations |
+| 3 | Saved dashboards and runbooks | Workspace |
+| 4 | OEM topology explorer | Topology |
+| 5 | Read-only SQL workbench | SQL |
+| 6 | Incident investigation workspace | Incidents |
+| 7 | Natural-language assistant | Assistant |
+| 8 | Tool-policy engine | Governance |
+| 9 | Two-person approval workflow | Governance |
+| 10 | Multi-OEM fleet connections | Workspace → Multi-OEM fleet |
+| 11 | Background job manager | Automation → Jobs |
+| 12 | Schedules, reports, and local alerts | Automation |
+| 13 | Usage and estimated-cost accounting | Usage & cost |
+
+Priority 1 (identity-provider/OIDC integration) was not requested and is not implemented. Operator and approver identifiers are therefore procedural strings. Shared or controlled-change deployments require an authenticated TLS reverse proxy now and a future trusted-identity binding before those identifiers can be treated as cryptographic identities.
 
 ## Supported OEM MCP behavior
 
@@ -104,9 +145,22 @@ OEM_MCP_PROTOCOL_VERSION=2025-11-25
 OEM_MCP_VERIFY_TLS=true
 OEM_MCP_CA_BUNDLE=
 OEM_MCP_TIMEOUT_SECONDS=60
+OEM_MCP_OPERATOR_ID=operator
+OEM_MCP_OPERATOR_ROLE=operator
+OEM_MCP_POLICY_FILE=./config/policy.example.json
+OEM_MCP_JOB_WORKERS=2
+
+# Optional OCI Generative AI planner; leave blank to use the local planner.
+OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
+OCI_GENAI_MODEL=
+OCI_GENAI_API_KEY=
+OCI_GENAI_INPUT_USD_PER_MILLION=0
+OCI_GENAI_OUTPUT_USD_PER_MILLION=0
 ```
 
 Leave `OEM_MCP_PASSWORD` blank to enter it in the GUI. If an unattended diagnostic requires a password, set it only in the protected runtime file and review the host's access controls.
+
+The optional AI adapter currently accepts a bearer key and never writes it to profiles, history, workspace data, or logs. Leave all `OCI_GENAI_*` values blank or zero to keep planning local. For production OCI deployment, add OCI SDK resource-principal or instance-principal request signing before relying on the AI integration.
 
 ### 2. Start on the configured port
 
@@ -254,8 +308,20 @@ The installers preserve the environment files. Review local changes before `git 
 4. Select protocol `2025-11-25` (or `2025-06-18` for a server that requires it).
 5. Click **Connect, initialize, and discover**.
 6. Review every authorized operation and schema in **Capabilities**.
-7. Run an operation from **Request**, or select discovered host/database/relationship operations under **Metrics**.
-8. Review timestamps, timings, and status in **History & logs**.
+7. Run an operation from **Request**, or use the focused **Operations**, **Topology**, or **SQL** workflow.
+8. Save reusable results and procedures under **Workspace**, and create investigation timelines under **Incidents**.
+9. Review policy decisions and exact-request approvals in **Governance** before any controlled execution.
+10. Queue bounded work or read-only schedules in **Automation**, then reconcile results in **Usage & cost** and **History & logs**.
+
+## Advanced workflow controls
+
+- Every focused execution uses the same JSON Schema validation, deny-first policy, approval lookup, mutation gate, SQL filter, OEM authorization, redacted history, and usage-recording path.
+- A matching deny policy always wins. If no custom rule matches, the safe fallback permits recognized read-only tools and validated `ExecuteSql`; other operations are denied.
+- Approval records bind a sanitized endpoint, exact tool name, and canonical arguments; secret-valued fields contribute one-way SHA-256 fingerprints while their persisted values remain redacted. The requester cannot approve the same request, and approvals expire.
+- Multi-OEM passwords and connected clients live only in the running Streamlit session and must be recreated after restart.
+- Jobs use a bounded in-process worker pool. Persisted `queued` or `running` records are evidence requiring reconciliation after a crash, not proof that execution resumed.
+- Schedules run only while the application and an authenticated OEM session are active. Direct external delivery is intentionally left to OCI Notifications or an approved enterprise channel.
+- Cost figures are estimates calculated from operator-configured token rates; OCI billing and Cost Analysis remain authoritative.
 
 ## Diagnostics and tests
 
@@ -327,7 +393,10 @@ sudo -u oracle /opt/oem-mcp-streamlit/venv/bin/python -m compileall -q "$PROJECT
 ## Deliberate limitations
 
 - No OAuth or SSE transport is implemented because Oracle's documented OEM MCP server uses Basic Authentication and stateless HTTP `POST` messages.
-- The client is not a general AI agent and does not translate natural language into operations.
+- The assistant proposes exactly one discovered operation and never auto-executes it. The optional OCI Generative AI adapter is bearer-key based; OCI IAM request signing is a future hardening item.
+- Priority 1 identity-provider integration is excluded. Two-person approval is procedural until the deployment binds operator identity through a trusted authenticated gateway.
+- Background work is process-local, schedules require an active authenticated application session, and external alert delivery is a platform integration rather than an in-app sender.
+- Topology is best-effort inference over live returned fields and must be checked against OEM before operational decisions.
 - Local history supports operator troubleshooting; it is not a replacement for OEM's authoritative server-side audit records.
 - Disabling TLS verification, enabling mutating tools, or enabling non-SELECT SQL weakens the safety boundary and requires an explicit operational security review.
 
@@ -335,6 +404,8 @@ sudo -u oracle /opt/oem-mcp-streamlit/venv/bin/python -m compileall -q "$PROJECT
 
 - [Oracle blog: Oracle Enterprise Manager MCP Server—Bringing Enterprise Manager Data to AI Agents](https://blogs.oracle.com/observability/oracle-enterprise-manager-mcp-server-bringing-enterprise-manager-data-to-ai-agents)
 - [Oracle Enterprise Manager 24ai MCP Server documentation](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emadm/enterprise-manager-model-context-protocol-server.html)
+- [Oracle OCI Architecture Diagram Toolkit and graphics guidance](https://docs.oracle.com/en-us/iaas/Content/General/Reference/graphicsfordiagrams.htm)
+- [Oracle OCI Generative AI OpenAI-compatible API](https://docs.oracle.com/en-us/iaas/Content/generative-ai/openai-compatible-api.htm)
 - [MCP lifecycle specification (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 - [MCP tools specification (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
 - [MCP transport specification (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)

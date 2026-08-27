@@ -4,6 +4,7 @@ import itertools
 import logging
 import time
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 import requests
@@ -56,6 +57,7 @@ class OemMcpClient:
         self._session = session or requests.Session()
         self._session.auth = HTTPBasicAuth(self.config.username, password)
         self._ids = itertools.count(1)
+        self._rpc_lock = RLock()
         self.session_id: str | None = None
         self.negotiated_protocol = self.config.protocol_version
         self.server_info: dict[str, Any] = {}
@@ -69,7 +71,7 @@ class OemMcpClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "MCP-Protocol-Version": self.negotiated_protocol,
-            "User-Agent": "oem-mcp-streamlit-client/0.1.0",
+            "User-Agent": "oem-mcp-streamlit-client/1.0.0",
         }
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
@@ -127,28 +129,30 @@ class OemMcpClient:
         return data
 
     def rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {"jsonrpc": "2.0", "id": next(self._ids), "method": method}
-        if params is not None:
-            payload["params"] = params
-        response = self._post(payload)
-        assert response is not None
-        if response.get("id") != payload["id"]:
-            raise McpProtocolError(f"{method} returned a mismatched JSON-RPC id.")
-        if "error" in response:
-            error = response.get("error") or {}
-            code = error.get("code", "unknown") if isinstance(error, dict) else "unknown"
-            message = error.get("message", "MCP request failed") if isinstance(error, dict) else "MCP request failed"
-            raise McpProtocolError(f"{method} failed ({code}): {message}")
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise McpProtocolError(f"{method} returned no result object.")
-        return result
+        with self._rpc_lock:
+            payload: dict[str, Any] = {"jsonrpc": "2.0", "id": next(self._ids), "method": method}
+            if params is not None:
+                payload["params"] = params
+            response = self._post(payload)
+            assert response is not None
+            if response.get("id") != payload["id"]:
+                raise McpProtocolError(f"{method} returned a mismatched JSON-RPC id.")
+            if "error" in response:
+                error = response.get("error") or {}
+                code = error.get("code", "unknown") if isinstance(error, dict) else "unknown"
+                message = error.get("message", "MCP request failed") if isinstance(error, dict) else "MCP request failed"
+                raise McpProtocolError(f"{method} failed ({code}): {message}")
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise McpProtocolError(f"{method} returned no result object.")
+            return result
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            payload["params"] = params
-        self._post(payload, allow_empty=True)
+        with self._rpc_lock:
+            payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+            if params is not None:
+                payload["params"] = params
+            self._post(payload, allow_empty=True)
 
     def initialize(self) -> dict[str, Any]:
         result = self.rpc(
@@ -156,7 +160,7 @@ class OemMcpClient:
             {
                 "protocolVersion": self.config.protocol_version,
                 "capabilities": {},
-                "clientInfo": {"name": "oem-mcp-streamlit-client", "version": "0.1.0"},
+                "clientInfo": {"name": "oem-mcp-streamlit-client", "version": "1.0.0"},
             },
         )
         negotiated = str(result.get("protocolVersion", ""))
