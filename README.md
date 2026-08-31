@@ -20,7 +20,7 @@ The reference deployment uses an OCI private application subnet, Oracle Linux 8 
 ## What the GUI provides
 
 - **Connection** — OEM endpoint, username, password, protocol version, request timeout, TLS verification, custom CA bundle, and reusable non-secret profiles.
-- **Capabilities** — initializes MCP and retrieves all advertised tools, prompts, resources, and resource templates, including pagination and input schemas.
+- **Capabilities** — initializes MCP and retrieves all advertised tools, prompts, resources, and resource templates, including pagination and input schemas. This tab is discovery-only; NLP requests belong in **Assistant**.
 - **Request** — builds an input form from the selected tool's JSON Schema, requires confirmation, validates the input, invokes `tools/call`, and renders structured results.
 - **Metrics** — shows the Streamlit Linux server's CPU/load, memory, disk, network, and process metrics. It also ranks authorized OEM tools for Linux targets, databases, and host-to-database relationships.
 - **Operations** — refreshes local Linux health, identifies likely OEM metric tools, charts live records, and saves redacted dashboard snapshots.
@@ -28,7 +28,7 @@ The reference deployment uses an OCI private application subnet, Oracle Linux 8 
 - **Topology** — invokes a discovered association operation and infers a Graphviz node/edge view while keeping the source result available for verification.
 - **SQL** — exposes only a discovered `ExecuteSql` operation, validates a single `SELECT`/`WITH`, and automatically applies a configurable row cap.
 - **Incidents** — creates local triage cases with severity, status, filtered evidence, and an append-only timestamped timeline.
-- **Assistant** — proposes one discovered tool using a deterministic local planner or an optional OCI Generative AI OpenAI-compatible endpoint; execution remains a separate reviewed action.
+- **Assistant** — translates NLP into one reviewed discovered-tool call or a read-only `ExecuteSql` proposal, executes only after confirmation, and can ask OCI Generative AI to explain the OEM result in natural language.
 - **Governance** — evaluates deny-first role/tool/target policy rules and supports expiring two-person approvals bound to the exact request hash.
 - **Automation** — runs bounded background jobs, queues due read-only schedules during an active authenticated session, creates downloadable reports, and records local alerts.
 - **Usage & cost** — records MCP/AI latency, status, token counts, configured cost estimates, and CSV exports.
@@ -150,17 +150,21 @@ OEM_MCP_OPERATOR_ROLE=operator
 OEM_MCP_POLICY_FILE=./config/policy.example.json
 OEM_MCP_JOB_WORKERS=2
 
-# Optional OCI Generative AI planner; leave blank to use the local planner.
+# Optional OCI Generative AI NLP planner and OEM-result explainer.
 OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
-OCI_GENAI_MODEL=
+OCI_GENAI_MODEL=openai.gpt-oss-120b
+OCI_GENAI_AUTH_MODE=api_key
+OCI_GENAI_PROJECT_OCID=
 OCI_GENAI_API_KEY=
+OCI_GENAI_PROFILE=DEFAULT
+OCI_GENAI_TIMEOUT_SECONDS=60
 OCI_GENAI_INPUT_USD_PER_MILLION=0
 OCI_GENAI_OUTPUT_USD_PER_MILLION=0
 ```
 
 Leave `OEM_MCP_PASSWORD` blank to enter it in the GUI. If an unattended diagnostic requires a password, set it only in the protected runtime file and review the host's access controls.
 
-The optional AI adapter currently accepts a bearer key and never writes it to profiles, history, workspace data, or logs. Leave all `OCI_GENAI_*` values blank or zero to keep planning local. For production OCI deployment, add OCI SDK resource-principal or instance-principal request signing before relying on the AI integration.
+The adapter supports a regional OCI Generative AI API key for initial testing and OCI session, instance-principal, or resource-principal IAM authentication. It never writes the key to profiles, history, workspace data, or logs. Leave the key blank when using an IAM mode. The **Assistant** tab remains optional; all direct MCP functionality works without an LLM.
 
 ### 2. Start on the configured port
 
@@ -313,6 +317,242 @@ The installers preserve the environment files. Review local changes before `git 
 9. Review policy decisions and exact-request approvals in **Governance** before any controlled execution.
 10. Queue bounded work or read-only schedules in **Automation**, then reconcile results in **Usage & cost** and **History & logs**.
 
+## Natural-language requests: Capabilities versus Assistant
+
+The OEM MCP server does not expose the Oracle AI Database Assistant chat box as an MCP tool. The two products share Enterprise Manager data and authorization, but they are different interfaces:
+
+- **Capabilities** discovers the tools authorized for the connected OEM user and shows each tool's exact JSON input schema. It does not accept NLP.
+- **Request** manually invokes a selected discovered tool after you complete its schema-generated form.
+- **Assistant** accepts NLP, asks the selected planner to propose one discovered tool plus arguments, requires review, invokes that tool through the normal safety path, and optionally asks OCI Generative AI to explain the returned OEM result.
+- **SQL** is a manual read-only workbench for a discovered `ExecuteSql` tool.
+
+The Streamlit NLP flow is deliberately reviewable:
+
+```text
+NLP request
+    → OCI model selects one actually discovered OEM tool and arguments
+    → operator reviews/corrects arguments or generated SQL
+    → policy + approval + read-only SQL validation
+    → OEM MCP tools/call
+    → raw OEM result
+    → optional OCI model summary grounded only in that result
+```
+
+### Run an NLP request
+
+1. In **Connection**, connect and wait for discovery to complete.
+2. In **Capabilities**, confirm that the account exposes a relevant incident, target, job, metric, status, or `ExecuteSql` tool. Expand the tool and inspect required properties.
+3. Open **Assistant**.
+4. Select **OCI Generative AI**. The local deterministic option only ranks tool names; it cannot reliably generate missing NLP arguments or SQL.
+5. Select an execution strategy:
+   - **Auto — prefer OEM operations**: recommended. It prefers a purpose-built OEM tool and uses `ExecuteSql` only when explicitly requested.
+   - **OEM operations only — exclude ExecuteSql**: prevents the planner from proposing SQL.
+   - **ExecuteSql only — read-only SQL**: sends only the discovered `ExecuteSql` schema to the planner.
+6. Enter the request and select **Build reviewed proposal**.
+7. Check the selected tool, explanation, confidence, and editable JSON arguments. When `ExecuteSql` is selected, the generated SQL is displayed separately.
+8. Correct any target name, time range, pagination limit, or SQL object. Select the review confirmation and then **Execute reviewed proposal**.
+9. Inspect the raw OEM result. To receive a concise answer, select **Generate a natural-language answer from this OEM result**. This second model call receives the original question and a redacted, bounded copy of the OEM result.
+10. Review latency, token counts, and configured cost estimates in **Usage & cost**. OEM server-side audit remains authoritative for the executed operation.
+
+### Example requests
+
+| NLP request | Recommended strategy | Expected planning behavior |
+| --- | --- | --- |
+| `List all open incidents` | Auto | Select an advertised incident-list/search tool and populate its open-status filter. |
+| `List targets that are down` | Auto | Select an advertised target/status tool and populate the availability filter. |
+| `Show job executions in the last 24 hours` | Auto | Select an advertised job-execution tool and populate its relative or absolute time range according to the live schema. |
+| `Summarize status for all my targets` | Auto | Select a target-status/list tool; after execution, use answer synthesis to summarize only the rows OEM returned. |
+| `Using ExecuteSql, count targets by target type from MGMT$TARGET` | ExecuteSql only | Generate one read-only query, show it for review, apply the SQL safety gate, then execute it through OEM. |
+
+Tool names and required argument names vary by OEM release and user privileges. The planner receives only the tools returned by the live **Capabilities** discovery and rejects a model-proposed tool name that was not discovered.
+
+### Important SQL limitation
+
+An MCP `ExecuteSql` input schema identifies the SQL argument but is not a catalog of OEM repository views and columns. The model must not invent repository objects. Prefer purpose-built OEM tools for incidents, targets, jobs, and metrics. If SQL is necessary, include the approved view/column context in the request, review the generated statement, and verify it against the OEM repository version.
+
+The client accepts one `SELECT` or `WITH` statement by default. It rejects DDL, DML, PL/SQL, and multiple statements even if the model proposes them. OEM privileges and the Free Query API apply an additional server-side authorization boundary.
+
+## OCI Generative AI setup — Frankfurt
+
+The LLM is optional for direct MCP use but required for reliable free-form NLP planning and natural-language answer synthesis in this client. The configuration below uses Germany Central (Frankfurt), region identifier `eu-frankfurt-1`, and the current OCI OpenAI-compatible endpoint.
+
+`openai.gpt-oss-120b` and `openai.gpt-oss-20b` are available in Frankfurt. Start with `openai.gpt-oss-120b` for stronger tool/SQL reasoning or test `openai.gpt-oss-20b` when lower latency is more important. Confirm current availability and pricing in your tenancy before production use.
+
+### 1. Select Frankfurt and create a Generative AI project
+
+1. Sign in to the OCI Console and select **Germany Central (Frankfurt)**.
+2. Open **Analytics & AI → Generative AI → Projects**.
+3. Select the compartment that will own the integration and create a project, for example `oem-mcp-nlp`.
+4. Configure response/conversation retention according to the organization's data-handling policy. This client uses stateless Chat Completions and does not create a conversation, but the project remains required by the `/openai/v1` API.
+5. Copy the project OCID. It resembles:
+
+```text
+ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa...
+```
+
+### 2A. Initial test with an OCI Generative AI API key
+
+Use this route for initial testing. OCI Generative AI API keys are not OCI IAM public/private key pairs; they are regional service secrets.
+
+1. In Frankfurt, open **Generative AI → API keys** and create a key in the same compartment/region as the model.
+2. Copy one generated secret immediately and retain the second secret for rotation. Do not put either secret in Git.
+3. Create an IAM policy. A compartment-scoped policy restricted to the generated key OCID is:
+
+```text
+allow any-user to use generative-ai-family in compartment <GENAI_COMPARTMENT_NAME>
+where ALL {request.principal.type='generativeaiapikey',
+           request.principal.id='<GENERATIVE_AI_API_KEY_OCID>'}
+```
+
+For an initial compartment-wide key policy, Oracle also documents:
+
+```text
+allow any-user to use generative-ai-family in compartment <GENAI_COMPARTMENT_NAME>
+where ALL {request.principal.type='generativeaiapikey'}
+```
+
+Prefer the single-key policy after obtaining the key OCID. Further restrict the policy to the chosen model when your IAM design is finalized.
+
+Edit the runtime environment file.
+
+Manual deployment:
+
+```bash
+vi "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env"
+chmod 600 "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env"
+```
+
+systemd deployment:
+
+```bash
+sudo vi /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
+sudo chown root:oinstall /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
+sudo chmod 640 /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
+```
+
+Set the following values with your real project OCID and secret:
+
+```dotenv
+OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
+OCI_GENAI_MODEL=openai.gpt-oss-120b
+OCI_GENAI_AUTH_MODE=api_key
+OCI_GENAI_PROJECT_OCID=ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa_REPLACE_ME
+OCI_GENAI_API_KEY=REPLACE_WITH_GENERATIVE_AI_API_KEY_SECRET
+OCI_GENAI_PROFILE=DEFAULT
+OCI_GENAI_TIMEOUT_SECONDS=120
+OCI_GENAI_INPUT_USD_PER_MILLION=0
+OCI_GENAI_OUTPUT_USD_PER_MILLION=0
+```
+
+The two cost variables are operator-maintained estimates. Set them from the current OCI price list or leave them at zero; OCI Billing and Cost Analysis remain authoritative.
+
+### 2B. Production on OCI Compute with instance-principal authentication
+
+For the Oracle Linux 8 Compute host, instance principal avoids a long-lived Generative AI API key.
+
+1. Copy the Compute instance OCID.
+2. Create a dynamic group, for example `oem-mcp-streamlit-instances`, with a narrow matching rule:
+
+```text
+ALL {instance.id = '<STREAMLIT_COMPUTE_INSTANCE_OCID>'}
+```
+
+3. Grant the dynamic group permission to use chat inference and the project in the Generative AI compartment:
+
+```text
+Allow dynamic-group oem-mcp-streamlit-instances to use generative-ai-chat
+in compartment <GENAI_COMPARTMENT_NAME>
+
+Allow dynamic-group oem-mcp-streamlit-instances to use generative-ai-project
+in compartment <GENAI_COMPARTMENT_NAME>
+```
+
+If the dynamic group belongs to a non-default identity domain, use the domain-qualified dynamic-group name required by the tenancy's IAM conventions. Keep permissions compartment-scoped unless a documented cross-compartment design requires otherwise.
+
+4. Ensure the instance can reach the Frankfurt Generative AI endpoint over TCP 443 through an internet gateway, NAT gateway, service gateway, approved proxy, or configured private endpoint as appropriate. Instance-principal authentication also needs access to the OCI instance metadata service.
+5. Configure the protected runtime file:
+
+```dotenv
+OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
+OCI_GENAI_MODEL=openai.gpt-oss-120b
+OCI_GENAI_AUTH_MODE=instance_principal
+OCI_GENAI_PROJECT_OCID=ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa_REPLACE_ME
+OCI_GENAI_API_KEY=
+OCI_GENAI_PROFILE=DEFAULT
+OCI_GENAI_TIMEOUT_SECONDS=120
+OCI_GENAI_INPUT_USD_PER_MILLION=0
+OCI_GENAI_OUTPUT_USD_PER_MILLION=0
+```
+
+The installed `oci-genai-auth` package supplies `OciInstancePrincipalAuth`; no `~/.oci/config`, fingerprint, or private key is required for this mode.
+
+### 2C. Development with an OCI CLI session profile
+
+For a temporary developer session rather than a service deployment:
+
+```bash
+oci session authenticate \
+  --region eu-frankfurt-1 \
+  --profile-name OEM_GENAI
+```
+
+Then use:
+
+```dotenv
+OCI_GENAI_AUTH_MODE=session
+OCI_GENAI_PROFILE=OEM_GENAI
+OCI_GENAI_PROJECT_OCID=ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa_REPLACE_ME
+OCI_GENAI_API_KEY=
+```
+
+The Streamlit process must run as the Linux user that owns and can read that OCI profile and its session-token files. Session authentication expires and is intended for development, not an unattended systemd service.
+
+`resource_principal` is also supported for OCI services such as Functions or OKE; it is not the correct choice for an ordinary Compute instance, where `instance_principal` should be used.
+
+### 3. Restart and validate
+
+Manual standalone deployment:
+
+```bash
+scripts/stop-standalone.sh --port 8502
+scripts/start-standalone.sh \
+  --env-file "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env" \
+  --address 127.0.0.1 \
+  --port 8502 \
+  --wait-seconds 60
+scripts/smoke-test.sh --address 127.0.0.1 --port 8502
+```
+
+systemd deployment:
+
+```bash
+sudo scripts/restart-service.sh
+sudo scripts/status-service.sh
+sudo journalctl -u oem-mcp-streamlit.service -n 100 --no-pager
+scripts/smoke-test.sh --address 127.0.0.1 --port 8502
+```
+
+Then connect to OEM and test in **Assistant**:
+
+```text
+Planner: OCI Generative AI
+Strategy: Auto — prefer OEM operations
+Request: List all open incidents
+```
+
+Build and review the proposal. After successful execution, generate the answer from the returned OEM result. Confirm two separate `assistant` events—`plan` and `answer`—under **Usage & cost**.
+
+### 4. OCI NLP troubleshooting
+
+- `OCI_GENAI_PROJECT_OCID is required`: the `/openai/v1` endpoint requires an OCI Generative AI project OCID.
+- `401` or `NotAuthorizedOrNotFound`: verify the authentication mode, regional key or instance-principal dynamic group, project compartment, IAM policy, and model availability.
+- `404`: use the complete Frankfurt base endpoint exactly as shown; the client appends `/chat/completions` through the OpenAI SDK.
+- No model choices or empty response: confirm that the selected model supports Chat Completions in Frankfurt and that the current tenancy has access/quota.
+- Instance-principal failure: verify the dynamic-group rule against the actual Compute instance OCID and test instance metadata/IAM access from the same host and service user.
+- Planner returns empty arguments: inspect the selected tool's required schema in **Capabilities** and add the missing target, time range, pagination, or approved SQL catalog context.
+- Generated SQL is rejected: the client permits only one read-only `SELECT`/`WITH`; correct the statement rather than weakening `OEM_MCP_ALLOW_NONSELECT_SQL`.
+- Answer synthesis omits rows: check whether the OEM tool paginated its response and whether the result was bounded before transmission. The raw OEM result remains visible for verification.
+
 ## Advanced workflow controls
 
 - Every focused execution uses the same JSON Schema validation, deny-first policy, approval lookup, mutation gate, SQL filter, OEM authorization, redacted history, and usage-recording path.
@@ -393,7 +633,8 @@ sudo -u oracle /opt/oem-mcp-streamlit/venv/bin/python -m compileall -q "$PROJECT
 ## Deliberate limitations
 
 - No OAuth or SSE transport is implemented because Oracle's documented OEM MCP server uses Basic Authentication and stateless HTTP `POST` messages.
-- The assistant proposes exactly one discovered operation and never auto-executes it. The optional OCI Generative AI adapter is bearer-key based; OCI IAM request signing is a future hardening item.
+- The assistant proposes exactly one discovered operation and never auto-executes it. It is not the built-in Oracle AI Database Assistant and does not implement autonomous multi-tool loops.
+- OCI Generative AI planning sends the NLP prompt and compact discovered-tool schemas to OCI. Answer synthesis separately sends the prompt and a redacted, bounded OEM result only after the operator selects the synthesis button.
 - Priority 1 identity-provider integration is excluded. Two-person approval is procedural until the deployment binds operator identity through a trusted authenticated gateway.
 - Background work is process-local, schedules require an active authenticated application session, and external alert delivery is a platform integration rather than an in-app sender.
 - Topology is best-effort inference over live returned fields and must be checked against OEM before operational decisions.
@@ -404,8 +645,13 @@ sudo -u oracle /opt/oem-mcp-streamlit/venv/bin/python -m compileall -q "$PROJECT
 
 - [Oracle blog: Oracle Enterprise Manager MCP Server—Bringing Enterprise Manager Data to AI Agents](https://blogs.oracle.com/observability/oracle-enterprise-manager-mcp-server-bringing-enterprise-manager-data-to-ai-agents)
 - [Oracle Enterprise Manager 24ai MCP Server documentation](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emadm/enterprise-manager-model-context-protocol-server.html)
+- [Oracle AI Database Assistant](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emadm/oracle-ai-database-assistant.html)
 - [Oracle OCI Architecture Diagram Toolkit and graphics guidance](https://docs.oracle.com/en-us/iaas/Content/General/Reference/graphicsfordiagrams.htm)
 - [Oracle OCI Generative AI OpenAI-compatible API](https://docs.oracle.com/en-us/iaas/Content/generative-ai/openai-compatible-api.htm)
+- [OCI Generative AI projects](https://docs.oracle.com/en-us/iaas/Content/generative-ai/projects.htm)
+- [OCI Generative AI API keys and supported API-key regions](https://docs.oracle.com/en-us/iaas/Content/generative-ai/api-keys.htm)
+- [OCI Generative AI IAM authentication helpers](https://docs.oracle.com/en-us/iaas/Content/generative-ai/oci-genai-auth.htm)
+- [OCI Generative AI models by region](https://docs.oracle.com/en-us/iaas/Content/generative-ai/model-endpoint-regions.htm)
 - [MCP lifecycle specification (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 - [MCP tools specification (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
 - [MCP transport specification (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)

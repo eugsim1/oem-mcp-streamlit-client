@@ -6,8 +6,6 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import requests
-
 
 @dataclass(frozen=True)
 class AssistantPlan:
@@ -17,6 +15,16 @@ class AssistantPlan:
     confidence: float
     provider: str = "local"
     model: str = "deterministic-tool-planner"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: int = 0
+
+
+@dataclass(frozen=True)
+class AssistantAnswer:
+    text: str
+    provider: str
+    model: str
     input_tokens: int = 0
     output_tokens: int = 0
     latency_ms: int = 0
@@ -77,19 +85,144 @@ def local_plan(prompt: str, tools: list[dict[str, Any]]) -> AssistantPlan:
 
 
 class OciGenAiPlanner:
-    """Optional OCI Generative AI OpenAI-compatible planner; it never executes tools."""
+    """OCI Generative AI planner and result explainer; it never executes OEM tools."""
 
-    def __init__(self, endpoint: str, api_key: str, model: str, timeout_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        api_key: str,
+        model: str,
+        timeout_seconds: int = 60,
+        *,
+        auth_mode: str = "api_key",
+        project_ocid: str = "",
+        profile: str = "DEFAULT",
+    ) -> None:
         if not endpoint.startswith("https://"):
             raise ValueError("OCI Generative AI endpoint must use HTTPS.")
-        if not api_key:
-            raise ValueError("OCI Generative AI API key is required.")
+        normalized_auth = auth_mode.strip().casefold().replace("-", "_")
+        if normalized_auth not in {"api_key", "instance_principal", "resource_principal", "session"}:
+            raise ValueError(
+                "OCI Generative AI authentication mode must be api_key, instance_principal, resource_principal, or session."
+            )
+        if normalized_auth == "api_key" and not api_key:
+            raise ValueError("OCI Generative AI API key is required when OCI_GENAI_AUTH_MODE=api_key.")
+        if not model.strip():
+            raise ValueError("OCI Generative AI model is required.")
+        if "/openai/v1" in endpoint and not project_ocid.strip():
+            raise ValueError("OCI_GENAI_PROJECT_OCID is required for the /openai/v1 endpoint.")
         self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key
-        self.model = model
+        self.model = model.strip()
+        self.auth_mode = normalized_auth
+        self.project_ocid = project_ocid.strip()
+        self.profile = profile.strip() or "DEFAULT"
         self.timeout_seconds = max(5, min(int(timeout_seconds), 300))
 
+    def _openai_client(self) -> Any:
+        try:
+            import httpx
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ValueError("OCI Generative AI support is not installed; rerun the project installer.") from exc
+
+        kwargs: dict[str, Any] = {
+            "base_url": self.endpoint,
+            "api_key": self.api_key if self.auth_mode == "api_key" else "not-used",
+            "timeout": self.timeout_seconds,
+        }
+        if self.project_ocid:
+            kwargs["project"] = self.project_ocid
+        if self.auth_mode != "api_key":
+            try:
+                from oci_genai_auth import (
+                    OciInstancePrincipalAuth,
+                    OciResourcePrincipalAuth,
+                    OciSessionAuth,
+                )
+            except ImportError as exc:
+                raise ValueError("OCI IAM authentication support is not installed; rerun the project installer.") from exc
+            if self.auth_mode == "instance_principal":
+                auth = OciInstancePrincipalAuth()
+            elif self.auth_mode == "resource_principal":
+                auth = OciResourcePrincipalAuth()
+            else:
+                auth = OciSessionAuth(profile_name=self.profile)
+            kwargs["http_client"] = httpx.Client(auth=auth, timeout=self.timeout_seconds)
+        return OpenAI(**kwargs)
+
+    @staticmethod
+    def _message_text(response: Any) -> str:
+        choices = getattr(response, "choices", None)
+        if not choices:
+            raise ValueError("OCI Generative AI response contained no choices.")
+        content = getattr(getattr(choices[0], "message", None), "content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                text = getattr(item, "text", None)
+                if text is None and isinstance(item, dict):
+                    text = item.get("text")
+                if text:
+                    parts.append(str(text))
+            return "\n".join(parts).strip()
+        return str(content or "").strip()
+
+    @staticmethod
+    def _usage(response: Any) -> tuple[int, int]:
+        usage = getattr(response, "usage", None)
+        return (
+            int(getattr(usage, "prompt_tokens", 0) or 0),
+            int(getattr(usage, "completion_tokens", 0) or 0),
+        )
+
+    def _complete(self, messages: list[dict[str, str]]) -> tuple[str, int, int, int]:
+        started = time.monotonic()
+        client = self._openai_client()
+        try:
+            response = client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                messages=messages,
+            )
+            text = self._message_text(response)
+            input_tokens, output_tokens = self._usage(response)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"OCI Generative AI request failed: {type(exc).__name__}: {exc}") from exc
+        finally:
+            client.close()
+        if not text:
+            raise ValueError("OCI Generative AI returned an empty response.")
+        return text, input_tokens, output_tokens, round((time.monotonic() - started) * 1000)
+
+    @staticmethod
+    def _json_object(content: str) -> dict[str, Any]:
+        clean = content.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", clean, flags=re.I | re.S).strip()
+        try:
+            value = json.loads(clean)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", clean, flags=re.S)
+            if not match:
+                raise ValueError("OCI Generative AI did not return a JSON planning object.") from None
+            try:
+                value = json.loads(match.group(0))
+            except json.JSONDecodeError as exc:
+                raise ValueError("OCI Generative AI returned invalid JSON for the tool proposal.") from exc
+        if not isinstance(value, dict):
+            raise ValueError("OCI Generative AI planning response must be a JSON object.")
+        return value
+
     def plan(self, prompt: str, tools: list[dict[str, Any]]) -> AssistantPlan:
+        if not prompt.strip():
+            raise ValueError("An operational request is required.")
+        if not tools:
+            raise ValueError("No discovered OEM tools are available for the selected strategy.")
         compact_tools = [
             {
                 "name": tool.get("name"),
@@ -99,38 +232,27 @@ class OciGenAiPlanner:
             for tool in tools[:200]
         ]
         system = (
-            "Select exactly one OEM MCP tool. Return JSON only with keys tool_name, arguments, explanation, confidence. "
-            "Do not invent a tool or execute anything. Arguments must conform to the supplied schema."
+            "You are a cautious Oracle Enterprise Manager tool planner. Select exactly one supplied OEM MCP tool and do not execute it. "
+            "Prefer a purpose-built incident, target, job, status, or metric operation over ExecuteSql. Use ExecuteSql only when it is "
+            "the only supplied tool or the request explicitly requires SQL. For ExecuteSql, generate exactly one read-only SELECT or WITH "
+            "statement and never generate DDL, DML, PL/SQL, or multiple statements. Do not invent tool names, arguments, target names, "
+            "database objects, or filters. Return JSON only with keys tool_name, arguments, explanation, confidence. Arguments must "
+            "conform to the supplied input schema. If required information is missing, return an empty arguments object and explain "
+            "what is missing."
         )
-        started = time.monotonic()
-        response = requests.post(
-            f"{self.endpoint}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json={
-                "model": self.model,
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": json.dumps({"request": prompt, "tools": compact_tools})},
-                ],
-            },
-            timeout=self.timeout_seconds,
+        content, input_tokens, output_tokens, latency_ms = self._complete(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps({"request": prompt, "tools": compact_tools})},
+            ]
         )
-        response.raise_for_status()
-        body = response.json()
-        choices = body.get("choices") if isinstance(body, dict) else None
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("OCI Generative AI response contained no choices.")
-        content = choices[0].get("message", {}).get("content", "")
-        proposal = json.loads(content)
+        proposal = self._json_object(content)
         known = {str(tool.get("name", "")) for tool in tools}
         if proposal.get("tool_name") not in known:
             raise ValueError("OCI Generative AI proposed a tool that was not discovered from OEM.")
         arguments = proposal.get("arguments")
         if not isinstance(arguments, dict):
             raise ValueError("OCI Generative AI did not return an arguments object.")
-        usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
         return AssistantPlan(
             tool_name=str(proposal["tool_name"]),
             arguments=arguments,
@@ -138,9 +260,46 @@ class OciGenAiPlanner:
             confidence=max(0.0, min(float(proposal.get("confidence", 0)), 1.0)),
             provider="oci-generative-ai",
             model=self.model,
-            input_tokens=int(usage.get("prompt_tokens", 0) or 0),
-            output_tokens=int(usage.get("completion_tokens", 0) or 0),
-            latency_ms=round((time.monotonic() - started) * 1000),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+        )
+
+    def answer(self, prompt: str, plan: AssistantPlan, result: Any) -> AssistantAnswer:
+        max_chars = 120_000
+        serialized = json.dumps(result, ensure_ascii=False, default=str)
+        if len(serialized) > max_chars:
+            serialized = serialized[:max_chars] + "\n[RESULT TRUNCATED BY CLIENT]"
+        system = (
+            "Answer the operator's question using only the supplied Oracle Enterprise Manager MCP result. Do not invent targets, "
+            "incidents, jobs, metrics, causes, or remediation. Clearly say when the result is empty, truncated, ambiguous, or contains "
+            "an OEM error. Provide a concise operational summary followed by the most relevant returned facts. Do not claim that an "
+            "action was performed."
+        )
+        content, input_tokens, output_tokens, latency_ms = self._complete(
+            [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "request": prompt,
+                            "executed_tool": plan.tool_name,
+                            "reviewed_arguments": plan.arguments,
+                            "oem_result": serialized,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ]
+        )
+        return AssistantAnswer(
+            text=content,
+            provider="oci-generative-ai",
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
         )
 
 

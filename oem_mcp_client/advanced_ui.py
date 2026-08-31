@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -16,7 +17,7 @@ from .jobs import BackgroundJobManager
 from .metrics import candidate_tools, collect_local_metrics
 from .operations import correlate_incident, health_score, infer_topology, result_rows, topology_dot
 from .policy import PolicyEngine
-from .safety import ToolSafetyError, bounded_read_only_sql, risk_label
+from .safety import ToolSafetyError, bounded_read_only_sql, redact, risk_label
 from .ui_helpers import render_tool_result
 from .workspace import WorkspaceStore
 
@@ -40,6 +41,34 @@ def _json_object(raw: str) -> tuple[dict[str, Any], str]:
     if not isinstance(value, dict):
         return {}, "Arguments must be a JSON object."
     return value, ""
+
+
+def _oci_planner() -> OciGenAiPlanner:
+    return OciGenAiPlanner(
+        os.getenv("OCI_GENAI_OPENAI_ENDPOINT", ""),
+        os.getenv("OCI_GENAI_API_KEY", ""),
+        os.getenv("OCI_GENAI_MODEL", ""),
+        int(os.getenv("OCI_GENAI_TIMEOUT_SECONDS", "60")),
+        auth_mode=os.getenv("OCI_GENAI_AUTH_MODE", "api_key"),
+        project_ocid=os.getenv("OCI_GENAI_PROJECT_OCID", ""),
+        profile=os.getenv("OCI_GENAI_PROFILE", "DEFAULT"),
+    )
+
+
+def _sql_argument(value: Any, parent_key: str = "") -> str:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _sql_argument(item, str(key))
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _sql_argument(item, parent_key)
+            if found:
+                return found
+    elif isinstance(value, str) and any(part in parent_key.casefold() for part in ("sql", "query", "statement")):
+        return value
+    return ""
 
 
 def _result_dataframe(result: dict[str, Any] | None) -> pd.DataFrame:
@@ -298,20 +327,63 @@ def render_incidents(workspace: WorkspaceStore) -> None:
 
 def render_assistant(discovered: dict[str, Any], execute: ExecuteCallback, workspace: WorkspaceStore) -> None:
     st.subheader("Natural-language assistant")
-    st.caption("The assistant proposes one discovered tool and arguments. It cannot bypass policy or execute without a separate click.")
-    provider = st.radio("Planner", ["Local deterministic", "OCI Generative AI"], horizontal=True)
-    prompt = st.text_area("Operational request", height=140, placeholder="Show critical database incidents from the last hour")
+    st.caption(
+        "Type NLP requests here, not in Capabilities. The assistant proposes one discovered OEM operation, "
+        "you review its arguments or SQL, and a separate click executes it through the normal policy and read-only gates."
+    )
+    tools = _tools(discovered)
+    if not tools:
+        st.info("Connect to OEM first. The assistant can only use tools discovered for the authenticated OEM account.")
+        return
+    with st.expander("Example requests and important behavior"):
+        st.code(
+            "List all open incidents\n"
+            "List targets that are down\n"
+            "Show job executions in the last 24 hours\n"
+            "Summarize status for all my targets\n"
+            "Using ExecuteSql and the approved MGMT$ views I provide, show ...",
+            language=None,
+        )
+        st.write(
+            "Auto mode prefers an advertised OEM incident, target, job, status, or metric tool. ExecuteSql mode requires "
+            "the model to generate a single read-only SELECT/WITH statement; review every database object because "
+            "the MCP tool schema is not a repository catalog."
+        )
+    provider = st.radio("Planner", ["Local deterministic (no LLM)", "OCI Generative AI"], horizontal=True)
+    strategy = st.selectbox(
+        "Execution strategy",
+        ["Auto — prefer OEM operations", "OEM operations only — exclude ExecuteSql", "ExecuteSql only — read-only SQL"],
+        help="Auto is recommended for incident, target, job, status, and metric questions.",
+    )
+    if strategy.startswith("OEM operations"):
+        planning_tools = [tool for tool in tools if str(tool.get("name", "")).casefold() != "executesql"]
+    elif strategy.startswith("ExecuteSql"):
+        planning_tools = [tool for tool in tools if str(tool.get("name", "")).casefold() == "executesql"]
+    else:
+        planning_tools = tools
+    prompt = st.text_area(
+        "Operational request",
+        height=140,
+        placeholder="List all open incidents",
+        key="assistant-prompt",
+    )
+    if provider.startswith("Local deterministic"):
+        st.info(
+            "The local planner ranks tool names and descriptions but does not translate free-form NLP into complete arguments or SQL. "
+            "Select OCI Generative AI for NLP argument/SQL generation and answer synthesis."
+        )
     if st.button("Build reviewed proposal", key="assistant-plan"):
         try:
             if provider == "OCI Generative AI":
-                endpoint = os.getenv("OCI_GENAI_OPENAI_ENDPOINT", "")
-                api_key = os.getenv("OCI_GENAI_API_KEY", "")
-                model = os.getenv("OCI_GENAI_MODEL", "")
-                planner = OciGenAiPlanner(endpoint, api_key, model)
-                plan = planner.plan(prompt, _tools(discovered))
+                plan = _oci_planner().plan(prompt, planning_tools)
             else:
-                plan = local_plan(prompt, _tools(discovered))
+                plan = local_plan(prompt, planning_tools)
             st.session_state["assistant_plan"] = plan
+            st.session_state["assistant_prompt_used"] = prompt
+            st.session_state["assistant_arguments_json"] = json.dumps(plan.arguments, indent=2, ensure_ascii=False)
+            st.session_state.pop("assistant_result", None)
+            st.session_state.pop("assistant_answer", None)
+            st.session_state["assistant-confirm"] = False
             cost = estimated_cost(
                 plan.input_tokens,
                 plan.output_tokens,
@@ -335,25 +407,86 @@ def render_assistant(discovered: dict[str, Any], execute: ExecuteCallback, works
         st.json(
             {
                 "tool_name": plan.tool_name,
-                "arguments": plan.arguments,
                 "explanation": plan.explanation,
                 "confidence": plan.confidence,
                 "provider": plan.provider,
                 "model": plan.model,
             }
         )
-        if st.button("Execute reviewed proposal", key="assistant-execute"):
-            tool = _tool(discovered, plan.tool_name)
-            if tool:
-                result = execute(tool, plan.arguments)
-                if result:
-                    st.session_state["assistant_result"] = result
+        reviewed_raw = st.text_area(
+            "Review or correct the generated arguments before execution",
+            height=220,
+            key="assistant_arguments_json",
+        )
+        reviewed_arguments, arguments_error = _json_object(reviewed_raw)
+        if arguments_error:
+            st.error(arguments_error)
+        generated_sql = _sql_argument(reviewed_arguments)
+        if str(plan.tool_name).casefold() == "executesql":
+            if generated_sql:
+                st.markdown("Generated read-only SQL")
+                st.code(generated_sql, language="sql")
+            else:
+                st.warning("The proposal does not contain a discoverable SQL argument and cannot pass the SQL safety gate.")
+        confirm = st.checkbox(
+            "I reviewed the selected OEM tool and every generated argument/SQL expression.",
+            key="assistant-confirm",
+        )
+        if st.button("Execute reviewed proposal", key="assistant-execute", disabled=bool(arguments_error)):
+            if not confirm:
+                st.error("Review confirmation is required before execution.")
+            else:
+                tool = _tool(discovered, plan.tool_name)
+                if tool:
+                    reviewed_plan = replace(plan, arguments=reviewed_arguments)
+                    result = execute(tool, reviewed_arguments)
+                    if result:
+                        st.session_state["assistant_plan"] = reviewed_plan
+                        st.session_state["assistant_result"] = result
+                        st.session_state.pop("assistant_answer", None)
         if isinstance(st.session_state.get("assistant_result"), dict):
-            render_tool_result(st.session_state["assistant_result"])
+            result = st.session_state["assistant_result"]
+            st.markdown("OEM result")
+            render_tool_result(result)
+            if plan.provider == "oci-generative-ai":
+                st.caption(
+                    "Answer synthesis sends the redacted OEM result and reviewed arguments to the configured OCI Generative AI model."
+                )
+                if st.button("Generate a natural-language answer from this OEM result", key="assistant-answer"):
+                    try:
+                        safe_plan = replace(plan, arguments=redact(plan.arguments))
+                        answer = _oci_planner().answer(
+                            str(st.session_state.get("assistant_prompt_used", prompt)),
+                            safe_plan,
+                            redact(result),
+                        )
+                        st.session_state["assistant_answer"] = answer
+                        cost = estimated_cost(
+                            answer.input_tokens,
+                            answer.output_tokens,
+                            float(os.getenv("OCI_GENAI_INPUT_USD_PER_MILLION", "0")),
+                            float(os.getenv("OCI_GENAI_OUTPUT_USD_PER_MILLION", "0")),
+                        )
+                        workspace.record_usage(
+                            category="assistant",
+                            operation="answer",
+                            provider=answer.provider,
+                            model=answer.model,
+                            input_tokens=answer.input_tokens,
+                            output_tokens=answer.output_tokens,
+                            estimated_cost=cost,
+                            latency_ms=answer.latency_ms,
+                        )
+                    except (McpClientError, requests.RequestException, ValueError) as exc:
+                        st.error(str(exc))
+                answer = st.session_state.get("assistant_answer")
+                if answer:
+                    st.markdown("### Answer")
+                    st.markdown(answer.text)
     if prompt:
         ranking = [
             {"score": score, "tool": tool.get("name"), "description": tool.get("description")}
-            for score, tool in rank_tools(prompt, _tools(discovered))[:5]
+            for score, tool in rank_tools(prompt, planning_tools)[:5]
         ]
         with st.expander("Top deterministic matches"):
             st.dataframe(pd.DataFrame(ranking), width="stretch", hide_index=True)

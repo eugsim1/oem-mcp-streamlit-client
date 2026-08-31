@@ -432,6 +432,11 @@ with connection_tab:
 
 with capabilities_tab:
     st.subheader("Discovered OEM MCP surface")
+    st.info(
+        "Capabilities is a discovery and schema-inspection tab; it does not translate natural language. "
+        "After connecting, use Assistant for NLP → reviewed OEM tool/SQL → result → optional OCI-generated answer, "
+        "or Request to invoke a known tool manually."
+    )
     client = active_client()
     if not client:
         st.info("Connect in the Connection tab to retrieve capabilities and options.")

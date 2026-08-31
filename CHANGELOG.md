@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 - 2026-08-31
+
+- Turn the Assistant tab into an explicit NLP workflow with selectable OEM-tool/SQL strategy, editable generated arguments, separate SQL display, and confirmation before execution.
+- Add OCI Generative AI answer synthesis grounded in a redacted, bounded OEM result while retaining the raw result for verification.
+- Support OCI Generative AI API-key, OCI CLI session, instance-principal, and resource-principal authentication through the official OpenAI-compatible client and OCI authentication helper.
+- Correct the Frankfurt configuration with a required Generative AI project OCID, current model examples, protected-secret guidance, IAM policies, deployment restart steps, and troubleshooting.
+- Clarify that Capabilities is discovery-only and document end-to-end examples for incidents, down targets, recent jobs, target status, and read-only `ExecuteSql`.
+
 ## 1.0.0 - 2026-08-27
 
 - Implement requested priorities 2–13: live operations, saved dashboards/runbooks, topology, read-only SQL, incident investigation, assistant planning, policy, exact-request approvals, multi-OEM connections, background jobs, schedules/reports/alerts, and usage/cost accounting.

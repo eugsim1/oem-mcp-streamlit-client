@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from oem_mcp_client.assistant import estimated_cost, local_plan
+from oem_mcp_client.assistant import OciGenAiPlanner, estimated_cost, local_plan
 from oem_mcp_client.jobs import BackgroundJobManager
 from oem_mcp_client.operations import health_score, infer_topology, topology_dot
 from oem_mcp_client.policy import PolicyEngine
@@ -42,6 +42,59 @@ def test_local_assistant_uses_only_discovered_tools() -> None:
     assert plan.tool_name == "ListIncidents"
     assert 0 <= plan.confidence <= 1
     assert estimated_cost(1000, 500, 1.0, 2.0) == pytest.approx(0.002)
+
+
+def test_oci_assistant_plans_discovered_tool_and_answers_from_result(monkeypatch) -> None:
+    planner = OciGenAiPlanner(
+        "https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1",
+        "test-only-key",
+        "openai.gpt-oss-120b",
+        project_ocid="ocid1.generativeaiproject.oc1.eu-frankfurt-1.test",
+    )
+    completions = iter(
+        [
+            ('{"tool_name":"ListIncidents","arguments":{"status":"OPEN"},"explanation":"Matches incidents.","confidence":0.9}', 10, 5, 12),
+            ("There is one open critical incident on DB1.", 20, 8, 15),
+        ]
+    )
+    monkeypatch.setattr(planner, "_complete", lambda _messages: next(completions))
+    tools = [
+        {
+            "name": "ListIncidents",
+            "description": "List incidents",
+            "inputSchema": {"type": "object", "properties": {"status": {"type": "string"}}},
+        }
+    ]
+    plan = planner.plan("List all open incidents", tools)
+    assert plan.tool_name == "ListIncidents"
+    assert plan.arguments == {"status": "OPEN"}
+    answer = planner.answer("List all open incidents", plan, {"items": [{"target": "DB1", "severity": "critical"}]})
+    assert "one open critical incident" in answer.text
+    assert answer.input_tokens == 20
+
+
+def test_oci_openai_endpoint_requires_project() -> None:
+    with pytest.raises(ValueError, match="PROJECT_OCID"):
+        OciGenAiPlanner(
+            "https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1",
+            "test-only-key",
+            "openai.gpt-oss-120b",
+        )
+
+
+def test_oci_api_key_client_sets_project_header() -> None:
+    project = "ocid1.generativeaiproject.oc1.eu-frankfurt-1.test"
+    planner = OciGenAiPlanner(
+        "https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1",
+        "test-only-key",
+        "openai.gpt-oss-120b",
+        project_ocid=project,
+    )
+    client = planner._openai_client()
+    try:
+        assert client.default_headers["OpenAI-Project"] == project
+    finally:
+        client.close()
 
 
 def test_topology_inference_builds_host_database_edge() -> None:
