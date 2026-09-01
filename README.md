@@ -384,19 +384,24 @@ The LLM is optional for direct MCP use but required for reliable free-form NLP p
 2. Open **Analytics & AI → Generative AI → Projects**.
 3. Select the compartment that will own the integration and create a project, for example `oem-mcp-nlp`.
 4. Configure response/conversation retention according to the organization's data-handling policy. This client uses stateless Chat Completions and does not create a conversation, but the project remains required by the `/openai/v1` API.
-5. Copy the project OCID. It resembles:
+5. Open the project details or its **How to use** tab and copy the project OCID. It resembles:
 
 ```text
 ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa...
 ```
 
+Put that complete value in `OCI_GENAI_PROJECT_OCID`. Replace the entire example, including `REPLACE_ME`; do not use the project's display name, compartment OCID, or an API-key OCID. The project region must match the Frankfurt inference endpoint.
+
 ### 2A. Initial test with an OCI Generative AI API key
 
 Use this route for initial testing. OCI Generative AI API keys are not OCI IAM public/private key pairs; they are regional service secrets.
 
-1. In Frankfurt, open **Generative AI → API keys** and create a key in the same compartment/region as the model.
-2. Copy one generated secret immediately and retain the second secret for rotation. Do not put either secret in Git.
-3. Create an IAM policy. A compartment-scoped policy restricted to the generated key OCID is:
+1. Keep the OCI Console in **Germany Central (Frankfurt)** and open **Analytics & AI → Generative AI → API keys**.
+2. Select the appropriate compartment and create a key, for example `oem-mcp-streamlit-api-key`. Configure the expiration dates required by the organization's key-rotation policy.
+3. Copy the API-key OCID, which starts with `ocid1.generativeaiapikey...`. This identifier is used in the IAM policy; it is not the API secret.
+4. Copy one generated secret immediately and store it in an approved secret store. This secret is displayed only at creation time and is the value for `OCI_GENAI_API_KEY`. A key has two independently usable secrets so one can be rotated without immediately interrupting the other.
+5. Do not put the OCID or secret into the wrong field, print the secret to a terminal log, paste it into an issue, or commit it to Git.
+6. Create an IAM policy. A compartment-scoped policy restricted to the generated API-key OCID is:
 
 ```text
 allow any-user to use generative-ai-family in compartment <GENAI_COMPARTMENT_NAME>
@@ -412,6 +417,14 @@ where ALL {request.principal.type='generativeaiapikey'}
 ```
 
 Prefer the single-key policy after obtaining the key OCID. Further restrict the policy to the chosen model when your IAM design is finalized.
+
+The three values are distinct:
+
+| Configuration or policy field | Where it comes from | Purpose |
+| --- | --- | --- |
+| `OCI_GENAI_PROJECT_OCID` | **Generative AI → Projects → project details/How to use** | Identifies the project required by the OpenAI-compatible API. It starts with `ocid1.generativeaiproject...`. |
+| `request.principal.id` in the IAM policy | **Generative AI → API keys → API-key details** | Restricts the policy to one API-key principal. It starts with `ocid1.generativeaiapikey...`. |
+| `OCI_GENAI_API_KEY` | Secret shown when the Generative AI API key is created | Authenticates the request. Copy the secret exactly; never substitute the API-key OCID. |
 
 Edit the runtime environment file.
 
@@ -444,7 +457,38 @@ OCI_GENAI_INPUT_USD_PER_MILLION=0
 OCI_GENAI_OUTPUT_USD_PER_MILLION=0
 ```
 
+Use the plain endpoint URL exactly as shown; Markdown such as `[URL](URL)` is not valid in an environment file. `OCI_GENAI_AUTH_MODE` must be `api_key` for this configuration. The API key and project must be usable in the same regional configuration as the model endpoint.
+
 The two cost variables are operator-maintained estimates. Set them from the current OCI price list or leave them at zero; OCI Billing and Cost Analysis remain authoritative.
+
+#### What `OCI_GENAI_PROFILE=DEFAULT` means
+
+An OCI SDK profile is a named section in the OCI configuration file, normally `~/.oci/config`. `DEFAULT` refers to the `[DEFAULT]` section. Profile names are not a fixed enumeration: any configured section name can be used, such as `[DEFAULT]`, `[FRANKFURT]`, `[PROD]`, or `[OEM_GENAI]`.
+
+For example:
+
+```ini
+[DEFAULT]
+user=ocid1.user.oc1...
+fingerprint=...
+tenancy=ocid1.tenancy.oc1...
+region=eu-frankfurt-1
+key_file=/home/oracle/.oci/oci_api_key.pem
+
+[OEM_GENAI]
+region=eu-frankfurt-1
+security_token_file=/home/oracle/.oci/sessions/OEM_GENAI/token
+key_file=/home/oracle/.oci/sessions/OEM_GENAI/oci_api_key.pem
+```
+
+In this application, the profile is read only when `OCI_GENAI_AUTH_MODE=session`. It is ignored in `api_key`, `instance_principal`, and `resource_principal` modes, so leaving `OCI_GENAI_PROFILE=DEFAULT` in the API-key configuration is harmless. Do not confuse an OCI SDK profile/API signing key with the separate OCI Generative AI regional API-key secret.
+
+| `OCI_GENAI_AUTH_MODE` | Project OCID | Generative AI API-key secret | SDK profile |
+| --- | --- | --- | --- |
+| `api_key` | Required | Required | Ignored |
+| `session` | Required | Leave blank | Required; name must exist in `~/.oci/config` |
+| `instance_principal` | Required | Leave blank | Ignored |
+| `resource_principal` | Required | Leave blank | Ignored |
 
 ### 2B. Production on OCI Compute with instance-principal authentication
 
@@ -545,7 +589,8 @@ Build and review the proposal. After successful execution, generate the answer f
 ### 4. OCI NLP troubleshooting
 
 - `OCI_GENAI_PROJECT_OCID is required`: the `/openai/v1` endpoint requires an OCI Generative AI project OCID.
-- `401` or `NotAuthorizedOrNotFound`: verify the authentication mode, regional key or instance-principal dynamic group, project compartment, IAM policy, and model availability.
+- `401`: verify that `OCI_GENAI_API_KEY` contains the API-key secret rather than the API-key OCID, that the secret has not expired, and that it belongs to the endpoint region.
+- `NotAuthorizedOrNotFound`: verify the specific-key IAM policy, its compartment scope, the API-key OCID in `request.principal.id`, the project OCID, and model availability.
 - `404`: use the complete Frankfurt base endpoint exactly as shown; the client appends `/chat/completions` through the OpenAI SDK.
 - No model choices or empty response: confirm that the selected model supports Chat Completions in Frankfurt and that the current tenancy has access/quota.
 - Instance-principal failure: verify the dynamic-group rule against the actual Compute instance OCID and test instance metadata/IAM access from the same host and service user.
@@ -649,9 +694,14 @@ sudo -u oracle /opt/oem-mcp-streamlit/venv/bin/python -m compileall -q "$PROJECT
 - [Oracle OCI Architecture Diagram Toolkit and graphics guidance](https://docs.oracle.com/en-us/iaas/Content/General/Reference/graphicsfordiagrams.htm)
 - [Oracle OCI Generative AI OpenAI-compatible API](https://docs.oracle.com/en-us/iaas/Content/generative-ai/openai-compatible-api.htm)
 - [OCI Generative AI projects](https://docs.oracle.com/en-us/iaas/Content/generative-ai/projects.htm)
+- [Create an OCI Generative AI project](https://docs.oracle.com/en-us/iaas/Content/generative-ai/create-project.htm)
+- [Use an OCI Generative AI project](https://docs.oracle.com/en-us/iaas/Content/generative-ai/use-project.htm)
 - [OCI Generative AI API keys and supported API-key regions](https://docs.oracle.com/en-us/iaas/Content/generative-ai/api-keys.htm)
+- [Create an OCI Generative AI API key](https://docs.oracle.com/en-us/iaas/Content/generative-ai/create-api-key.htm)
+- [Add IAM permissions for a Generative AI API key](https://docs.oracle.com/en-us/iaas/Content/generative-ai/add-api-permission.htm)
 - [OCI Generative AI IAM authentication helpers](https://docs.oracle.com/en-us/iaas/Content/generative-ai/oci-genai-auth.htm)
 - [OCI Generative AI models by region](https://docs.oracle.com/en-us/iaas/Content/generative-ai/model-endpoint-regions.htm)
+- [OCI SDK configuration profiles](https://docs.oracle.com/en-us/iaas/tools/python/latest/configuration.html)
 - [MCP lifecycle specification (2025-11-25)](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 - [MCP tools specification (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
 - [MCP transport specification (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)

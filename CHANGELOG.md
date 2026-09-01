@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 - 2026-09-01
+
+- Document the complete Frankfurt Generative AI API-key workflow, including project creation, regional key creation, specific-key IAM policy, protected secret storage, and validation.
+- Distinguish the Generative AI project OCID, API-key OCID, and one-time API-key secret to prevent authentication and policy misconfiguration.
+- Explain OCI SDK profiles, their operator-defined names, and which authentication modes use or ignore `OCI_GENAI_PROFILE`.
+
 ## 1.1.0 - 2026-08-31
 
 - Turn the Assistant tab into an explicit NLP workflow with selectable OEM-tool/SQL strategy, editable generated arguments, separate SQL display, and confirmation before execution.
