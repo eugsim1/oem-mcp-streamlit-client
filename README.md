@@ -151,13 +151,13 @@ OEM_MCP_POLICY_FILE=./config/policy.example.json
 OEM_MCP_JOB_WORKERS=2
 
 # Optional OCI Generative AI NLP planner and OEM-result explainer.
-OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
+OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/20231130/actions/v1
 OCI_GENAI_MODEL=openai.gpt-oss-120b
 OCI_GENAI_AUTH_MODE=api_key
 OCI_GENAI_PROJECT_OCID=
 OCI_GENAI_API_KEY=
 OCI_GENAI_PROFILE=DEFAULT
-OCI_GENAI_TIMEOUT_SECONDS=60
+OCI_GENAI_TIMEOUT_SECONDS=120
 OCI_GENAI_INPUT_USD_PER_MILLION=0
 OCI_GENAI_OUTPUT_USD_PER_MILLION=0
 ```
@@ -374,134 +374,123 @@ The client accepts one `SELECT` or `WITH` statement by default. It rejects DDL, 
 
 ## OCI Generative AI setup — Frankfurt
 
-The LLM is optional for direct MCP use but required for reliable free-form NLP planning and natural-language answer synthesis in this client. The configuration below uses Germany Central (Frankfurt), region identifier `eu-frankfurt-1`, and the current OCI OpenAI-compatible endpoint.
+The LLM is optional for direct MCP use but required for reliable free-form NLP planning and natural-language answer synthesis in this client. These examples use Germany Central (Frankfurt), region identifier `eu-frankfurt-1`. `openai.gpt-oss-120b` and `openai.gpt-oss-20b` are documented for Frankfurt; confirm current model access, limits, and pricing in the tenancy before production use.
 
-`openai.gpt-oss-120b` and `openai.gpt-oss-20b` are available in Frankfurt. Start with `openai.gpt-oss-120b` for stronger tool/SQL reasoning or test `openai.gpt-oss-20b` when lower latency is more important. Confirm current availability and pricing in your tenancy before production use.
+### Choose the endpoint and authentication route
 
-### 1. Select Frankfurt and create a Generative AI project
+OCI exposes two relevant OpenAI-compatible base paths. Do not mix their requirements:
+
+| Use case | Base endpoint | `OCI_GENAI_AUTH_MODE` | Project OCID | API-key secret | SDK profile |
+| --- | --- | --- | --- | --- | --- |
+| Simplest regional Generative AI API-key test | `https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/20231130/actions/v1` | `api_key` | Leave blank; not sent | Required | Ignored |
+| API key through a Generative AI project | `https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1` | `api_key` | Required | Required | Ignored |
+| OCI CLI session | `https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1` | `session` | Required | Leave blank | Required |
+| OCI Compute instance principal | `https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1` | `instance_principal` | Required | Leave blank | Ignored |
+| OCI resource principal | `https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1` | `resource_principal` | Required | Leave blank | Ignored |
+
+API-key authentication is independent of Compute instance-principal configuration. A Compute instance does **not** need to be in a dynamic group when `OCI_GENAI_AUTH_MODE=api_key`; the Generative AI API-key principal and its IAM policy authorize that request.
+
+### 1A. Simplest API-key setup and IAM policy
 
 1. Sign in to the OCI Console and select **Germany Central (Frankfurt)**.
-2. Open **Analytics & AI → Generative AI → Projects**.
-3. Select the compartment that will own the integration and create a project, for example `oem-mcp-nlp`.
-4. Configure response/conversation retention according to the organization's data-handling policy. This client uses stateless Chat Completions and does not create a conversation, but the project remains required by the `/openai/v1` API.
-5. Open the project details or its **How to use** tab and copy the project OCID. It resembles:
+2. Open **Analytics & AI → Generative AI → API keys**, choose the compartment, and create a regional key.
+3. Copy the API-key OCID beginning with `ocid1.generativeaiapikey...`; it identifies the principal in IAM but is not a secret.
+4. Copy one generated secret immediately. This one-time secret is the value for `OCI_GENAI_API_KEY`. Store it in an approved secret store and rotate it according to organizational policy.
+5. Create a least-privilege IAM policy. A policy restricted to one key and one compartment is:
 
 ```text
-ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa...
-```
-
-Put that complete value in `OCI_GENAI_PROJECT_OCID`. Replace the entire example, including `REPLACE_ME`; do not use the project's display name, compartment OCID, or an API-key OCID. The project region must match the Frankfurt inference endpoint.
-
-### 2A. Initial test with an OCI Generative AI API key
-
-Use this route for initial testing. OCI Generative AI API keys are not OCI IAM public/private key pairs; they are regional service secrets.
-
-1. Keep the OCI Console in **Germany Central (Frankfurt)** and open **Analytics & AI → Generative AI → API keys**.
-2. Select the appropriate compartment and create a key, for example `oem-mcp-streamlit-api-key`. Configure the expiration dates required by the organization's key-rotation policy.
-3. Copy the API-key OCID, which starts with `ocid1.generativeaiapikey...`. This identifier is used in the IAM policy; it is not the API secret.
-4. Copy one generated secret immediately and store it in an approved secret store. This secret is displayed only at creation time and is the value for `OCI_GENAI_API_KEY`. A key has two independently usable secrets so one can be rotated without immediately interrupting the other.
-5. Do not put the OCID or secret into the wrong field, print the secret to a terminal log, paste it into an issue, or commit it to Git.
-6. Create an IAM policy. A compartment-scoped policy restricted to the generated API-key OCID is:
-
-```text
-allow any-user to use generative-ai-family in compartment <GENAI_COMPARTMENT_NAME>
+Allow any-user to use generative-ai-family in compartment <GENAI_COMPARTMENT_NAME>
 where ALL {request.principal.type='generativeaiapikey',
            request.principal.id='<GENERATIVE_AI_API_KEY_OCID>'}
 ```
 
-For an initial compartment-wide key policy, Oracle also documents:
+For a short tenancy-wide administrator diagnostic, the broad form is:
 
 ```text
-allow any-user to use generative-ai-family in compartment <GENAI_COMPARTMENT_NAME>
+Allow any-user to use generative-ai-family in tenancy
 where ALL {request.principal.type='generativeaiapikey'}
 ```
 
-Prefer the single-key policy after obtaining the key OCID. Further restrict the policy to the chosen model when your IAM design is finalized.
+Reduce the broad policy to the single-key, compartment-scoped form after the test. `Allow group Administrators ... where request.principal.type='generativeaiapikey'` is not the equivalent policy: an API-key request is an `any-user` Generative AI API-key principal, not an Administrators-group user principal. Preserve both closing quotes and braces when entering the policy.
 
-The three values are distinct:
-
-| Configuration or policy field | Where it comes from | Purpose |
-| --- | --- | --- |
-| `OCI_GENAI_PROJECT_OCID` | **Generative AI → Projects → project details/How to use** | Identifies the project required by the OpenAI-compatible API. It starts with `ocid1.generativeaiproject...`. |
-| `request.principal.id` in the IAM policy | **Generative AI → API keys → API-key details** | Restricts the policy to one API-key principal. It starts with `ocid1.generativeaiapikey...`. |
-| `OCI_GENAI_API_KEY` | Secret shown when the Generative AI API key is created | Authenticates the request. Copy the secret exactly; never substitute the API-key OCID. |
-
-Edit the runtime environment file.
-
-Manual deployment:
-
-```bash
-vi "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env"
-chmod 600 "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env"
-```
-
-systemd deployment:
-
-```bash
-sudo vi /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
-sudo chown root:oinstall /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
-sudo chmod 640 /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
-```
-
-Set the following values with your real project OCID and secret:
+Configure the protected runtime file:
 
 ```dotenv
-OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
+OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/20231130/actions/v1
 OCI_GENAI_MODEL=openai.gpt-oss-120b
 OCI_GENAI_AUTH_MODE=api_key
-OCI_GENAI_PROJECT_OCID=ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa_REPLACE_ME
-OCI_GENAI_API_KEY=REPLACE_WITH_GENERATIVE_AI_API_KEY_SECRET
+OCI_GENAI_PROJECT_OCID=
+OCI_GENAI_API_KEY=REPLACE_WITH_GENERATED_SECRET_NOT_THE_KEY_OCID
 OCI_GENAI_PROFILE=DEFAULT
 OCI_GENAI_TIMEOUT_SECONDS=120
 OCI_GENAI_INPUT_USD_PER_MILLION=0
 OCI_GENAI_OUTPUT_USD_PER_MILLION=0
 ```
 
-Use the plain endpoint URL exactly as shown; Markdown such as `[URL](URL)` is not valid in an environment file. `OCI_GENAI_AUTH_MODE` must be `api_key` for this configuration. The API key and project must be usable in the same regional configuration as the model endpoint.
+Use only the plain endpoint. This value is invalid because it contains Markdown:
+
+```text
+[https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/...](https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/...)
+```
+
+`echo $$OCI_GENAI_API_KEY` is also not a variable check: `$$` expands to the shell process ID and the remaining text is literal. Never print the secret. A safe presence check is:
+
+```bash
+printf 'Secret configured: %s; length=%s\n' \
+  "$([[ -n ${OCI_GENAI_API_KEY:-} ]] && printf yes || printf no)" \
+  "${#OCI_GENAI_API_KEY}"
+```
+
+Edit and protect the file as appropriate:
+
+```bash
+# Manual deployment
+vi "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env"
+chmod 600 "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env"
+
+# systemd deployment
+sudo vi /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
+sudo chown root:oinstall /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
+sudo chmod 640 /etc/oem-mcp-streamlit/oem-mcp-streamlit.env
+```
 
 The two cost variables are operator-maintained estimates. Set them from the current OCI price list or leave them at zero; OCI Billing and Cost Analysis remain authoritative.
 
-#### What `OCI_GENAI_PROFILE=DEFAULT` means
+### 1B. Optional project endpoint
 
-An OCI SDK profile is a named section in the OCI configuration file, normally `~/.oci/config`. `DEFAULT` refers to the `[DEFAULT]` section. Profile names are not a fixed enumeration: any configured section name can be used, such as `[DEFAULT]`, `[FRANKFURT]`, `[PROD]`, or `[OEM_GENAI]`.
+Use this route when the OCI project workflow or an IAM authentication mode is required:
 
-For example:
+1. In Frankfurt, open **Analytics & AI → Generative AI → Projects**.
+2. Create a project such as `oem-mcp-nlp` in the intended compartment and configure retention according to the organization's data-handling policy.
+3. Open **How to use** or project details and copy the project OCID beginning with `ocid1.generativeaiproject...`.
+4. Change the endpoint to `/openai/v1` and set the project OCID:
 
-```ini
-[DEFAULT]
-user=ocid1.user.oc1...
-fingerprint=...
-tenancy=ocid1.tenancy.oc1...
-region=eu-frankfurt-1
-key_file=/home/oracle/.oci/oci_api_key.pem
-
-[OEM_GENAI]
-region=eu-frankfurt-1
-security_token_file=/home/oracle/.oci/sessions/OEM_GENAI/token
-key_file=/home/oracle/.oci/sessions/OEM_GENAI/oci_api_key.pem
+```dotenv
+OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
+OCI_GENAI_AUTH_MODE=api_key
+OCI_GENAI_PROJECT_OCID=ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa_REPLACE_ME
+OCI_GENAI_API_KEY=REPLACE_WITH_GENERATED_SECRET_NOT_THE_KEY_OCID
 ```
 
-In this application, the profile is read only when `OCI_GENAI_AUTH_MODE=session`. It is ignored in `api_key`, `instance_principal`, and `resource_principal` modes, so leaving `OCI_GENAI_PROFILE=DEFAULT` in the API-key configuration is harmless. Do not confuse an OCI SDK profile/API signing key with the separate OCI Generative AI regional API-key secret.
+The three identifiers remain distinct:
 
-| `OCI_GENAI_AUTH_MODE` | Project OCID | Generative AI API-key secret | SDK profile |
-| --- | --- | --- | --- |
-| `api_key` | Required | Required | Ignored |
-| `session` | Required | Leave blank | Required; name must exist in `~/.oci/config` |
-| `instance_principal` | Required | Leave blank | Ignored |
-| `resource_principal` | Required | Leave blank | Ignored |
+| Field | Expected value |
+| --- | --- |
+| `OCI_GENAI_PROJECT_OCID` | Project identifier beginning `ocid1.generativeaiproject...` |
+| `request.principal.id` in IAM | API-key identifier beginning `ocid1.generativeaiapikey...` |
+| `OCI_GENAI_API_KEY` | Generated secret; never an OCID |
 
-### 2B. Production on OCI Compute with instance-principal authentication
+### 2. Production on OCI Compute with instance principal
 
-For the Oracle Linux 8 Compute host, instance principal avoids a long-lived Generative AI API key.
+Instance principal avoids storing a long-lived Generative AI API-key secret. It is an alternative to `api_key`, not a prerequisite for it.
 
-1. Copy the Compute instance OCID.
-2. Create a dynamic group, for example `oem-mcp-streamlit-instances`, with a narrow matching rule:
+1. Create a dynamic group with a narrow rule such as:
 
 ```text
 ALL {instance.id = '<STREAMLIT_COMPUTE_INSTANCE_OCID>'}
 ```
 
-3. Grant the dynamic group permission to use chat inference and the project in the Generative AI compartment:
+2. Grant the dynamic group access to chat inference and the project in the selected compartment:
 
 ```text
 Allow dynamic-group oem-mcp-streamlit-instances to use generative-ai-chat
@@ -511,10 +500,7 @@ Allow dynamic-group oem-mcp-streamlit-instances to use generative-ai-project
 in compartment <GENAI_COMPARTMENT_NAME>
 ```
 
-If the dynamic group belongs to a non-default identity domain, use the domain-qualified dynamic-group name required by the tenancy's IAM conventions. Keep permissions compartment-scoped unless a documented cross-compartment design requires otherwise.
-
-4. Ensure the instance can reach the Frankfurt Generative AI endpoint over TCP 443 through an internet gateway, NAT gateway, service gateway, approved proxy, or configured private endpoint as appropriate. Instance-principal authentication also needs access to the OCI instance metadata service.
-5. Configure the protected runtime file:
+3. Configure the project endpoint and leave the secret blank:
 
 ```dotenv
 OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
@@ -524,15 +510,13 @@ OCI_GENAI_PROJECT_OCID=ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa_REPLACE
 OCI_GENAI_API_KEY=
 OCI_GENAI_PROFILE=DEFAULT
 OCI_GENAI_TIMEOUT_SECONDS=120
-OCI_GENAI_INPUT_USD_PER_MILLION=0
-OCI_GENAI_OUTPUT_USD_PER_MILLION=0
 ```
 
-The installed `oci-genai-auth` package supplies `OciInstancePrincipalAuth`; no `~/.oci/config`, fingerprint, or private key is required for this mode.
+The `oci-genai-auth` dependency supplies `OciInstancePrincipalAuth`; no OCI SDK profile or API signing key is needed. The instance still needs TCP 443 egress to the Frankfurt inference endpoint and access to the OCI instance metadata service. Test as the same Linux service user because network, environment, and file permissions can differ by user.
 
-### 2C. Development with an OCI CLI session profile
+### 3. Development with an OCI CLI session profile
 
-For a temporary developer session rather than a service deployment:
+An OCI SDK profile is a named section in `~/.oci/config`. `DEFAULT` means `[DEFAULT]`; profile names are operator-defined, so `[FRANKFURT]`, `[PROD]`, and `[OEM_GENAI]` are also possible. This application reads the profile only in `session` mode.
 
 ```bash
 oci session authenticate \
@@ -540,20 +524,99 @@ oci session authenticate \
   --profile-name OEM_GENAI
 ```
 
-Then use:
-
 ```dotenv
+OCI_GENAI_OPENAI_ENDPOINT=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com/openai/v1
 OCI_GENAI_AUTH_MODE=session
 OCI_GENAI_PROFILE=OEM_GENAI
 OCI_GENAI_PROJECT_OCID=ocid1.generativeaiproject.oc1.eu-frankfurt-1.aaaa_REPLACE_ME
 OCI_GENAI_API_KEY=
 ```
 
-The Streamlit process must run as the Linux user that owns and can read that OCI profile and its session-token files. Session authentication expires and is intended for development, not an unattended systemd service.
+The Streamlit process must run as the Linux user that can read that profile and its session files. Sessions expire and are not suitable for an unattended systemd service. `resource_principal` is intended for services such as Functions or OKE; use `instance_principal` for an ordinary OCI Compute instance.
 
-`resource_principal` is also supported for OCI services such as Functions or OKE; it is not the correct choice for an ordinary Compute instance, where `instance_principal` should be used.
+### 4. Standalone API-key diagnostic — no Streamlit
 
-### 3. Restart and validate
+The standard-library test program sends one fixed harmless prompt to the OCI Responses API. It does not import Streamlit or the OpenAI SDK, execute an environment file as shell code, print the API-key secret, write credentials, follow redirects, or contact OEM.
+
+From the project directory, test the manual runtime file:
+
+```bash
+python3.11 scripts/oci_genai_diagnostic.py \
+  --env-file "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env"
+```
+
+If `OCI_GENAI_API_KEY` is blank, the program prompts securely. For non-interactive testing, populate the protected file and add `--no-prompt`. Validate the values without sending a request:
+
+```bash
+python3.11 scripts/oci_genai_diagnostic.py \
+  --env-file "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env" \
+  --check-config
+```
+
+Test the systemd configuration as the service user:
+
+```bash
+sudo -u oracle "$PROJECT_DIR/.venv/bin/python" \
+  "$PROJECT_DIR/scripts/oci_genai_diagnostic.py" \
+  --env-file /etc/oem-mcp-streamlit/oem-mcp-streamlit.env \
+  --no-prompt
+```
+
+If the normal request returns an HTML `400`, bypass proxy variables for one controlled test:
+
+```bash
+python3.11 scripts/oci_genai_diagnostic.py \
+  --env-file "$PROJECT_DIR/.runtime/oem-mcp-streamlit.env" \
+  --no-proxy
+```
+
+The program prints configured proxy variable names but never their values. If `--no-proxy` succeeds, work with the network team to correct `HTTPS_PROXY` and `NO_PROXY`; do not permanently bypass an organization-required proxy.
+
+### 5. Manual debug checklist
+
+1. Confirm the non-secret values are plain strings. `declare -p` preserves hidden characters and makes accidental Markdown visible:
+
+   ```bash
+   declare -p OCI_GENAI_OPENAI_ENDPOINT OCI_GENAI_MODEL OCI_GENAI_AUTH_MODE
+   declare -p OCI_GENAI_PROJECT_OCID
+   ```
+
+2. Confirm DNS and TLS without sending credentials:
+
+   ```bash
+   getent ahosts inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com
+   openssl s_client \
+     -connect inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com:443 \
+     -servername inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com \
+     </dev/null
+   ```
+
+3. List only the names of configured proxy variables, never their possibly credential-bearing values:
+
+   ```bash
+   for name in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NO_PROXY no_proxy; do
+     [[ -n ${!name:-} ]] && printf '%s=<set>\n' "$name"
+   done
+   ```
+
+4. In the Frankfurt OCI Console, open the Generative AI playground/project model selector. Confirm `openai.gpt-oss-120b` is selectable for the same region and compartment. Also check **Governance & Administration → Limits, Quotas and Usage** for Generative AI capacity. A model listed in documentation can still be unavailable to a particular tenancy, endpoint type, or capacity configuration.
+5. Recheck the key's region, active/expiration state, the exact API-key OCID used in IAM, policy placement and compartment, and allow time for a recent IAM policy change to propagate.
+6. Do not use `curl -v`, shell tracing (`set -x`), command-line `--header "Authorization: Bearer ..."` in shared process listings, or diagnostic archives containing the secret.
+
+Response interpretation:
+
+| Result | Meaning and next check |
+| --- | --- |
+| `2xx` JSON | Authentication, endpoint, model, and request shape worked. Continue with Streamlit. |
+| `400` HTML | A proxy/gateway or malformed/re-written URL answered before the OCI JSON API. This is not caused by the Compute instance lacking instance-principal setup. Check Markdown in the endpoint, proxy variables, DNS/TLS interception, and `--no-proxy`. |
+| `400` JSON | Read the OCI message; check the base path, model, body shape, and project header requirement. |
+| `401` JSON | The bearer value is missing, expired, or is the API-key OCID instead of the generated secret. |
+| `403`/`404` JSON | Check IAM scope, API-key OCID, key region, project access for `/openai/v1`, model visibility, and endpoint availability. OCI can intentionally combine authorization and not-found responses. |
+| Timeout/DNS/TLS error | Check route/NAT/service gateway/proxy/firewall/CA and run from the same user and host as Streamlit. |
+
+An HTML page has no OCI `opc-request-id` and is not useful evidence for changing IAM. A JSON OCI error plus `opc-request-id` is the point at which IAM, project, key, and model authorization should be reviewed.
+
+### 6. Restart Streamlit and validate the NLP workflow
 
 Manual standalone deployment:
 
@@ -584,19 +647,14 @@ Strategy: Auto — prefer OEM operations
 Request: List all open incidents
 ```
 
-Build and review the proposal. After successful execution, generate the answer from the returned OEM result. Confirm two separate `assistant` events—`plan` and `answer`—under **Usage & cost**.
+Build and review the proposal. After successful execution, generate the answer from the returned OEM result. Confirm separate `assistant` events for `plan` and `answer` under **Usage & cost**.
 
-### 4. OCI NLP troubleshooting
+Application-level troubleshooting after the standalone OCI test passes:
 
-- `OCI_GENAI_PROJECT_OCID is required`: the `/openai/v1` endpoint requires an OCI Generative AI project OCID.
-- `401`: verify that `OCI_GENAI_API_KEY` contains the API-key secret rather than the API-key OCID, that the secret has not expired, and that it belongs to the endpoint region.
-- `NotAuthorizedOrNotFound`: verify the specific-key IAM policy, its compartment scope, the API-key OCID in `request.principal.id`, the project OCID, and model availability.
-- `404`: use the complete Frankfurt base endpoint exactly as shown; the client appends `/chat/completions` through the OpenAI SDK.
-- No model choices or empty response: confirm that the selected model supports Chat Completions in Frankfurt and that the current tenancy has access/quota.
-- Instance-principal failure: verify the dynamic-group rule against the actual Compute instance OCID and test instance metadata/IAM access from the same host and service user.
+- `OCI_GENAI_PROJECT_OCID is required`: `/openai/v1` requires a project OCID; either provide it or use the `/20231130/actions/v1` API-key route.
 - Planner returns empty arguments: inspect the selected tool's required schema in **Capabilities** and add the missing target, time range, pagination, or approved SQL catalog context.
 - Generated SQL is rejected: the client permits only one read-only `SELECT`/`WITH`; correct the statement rather than weakening `OEM_MCP_ALLOW_NONSELECT_SQL`.
-- Answer synthesis omits rows: check whether the OEM tool paginated its response and whether the result was bounded before transmission. The raw OEM result remains visible for verification.
+- Answer synthesis omits rows: check OEM pagination and whether the result was bounded before transmission. The raw OEM result remains visible for verification.
 
 ## Advanced workflow controls
 

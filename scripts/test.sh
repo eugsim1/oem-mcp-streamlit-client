@@ -12,7 +12,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -x "${VENV_DIR}/bin/python" ]] || die "virtual environment is missing: ${VENV_DIR}"
 cd "${PROJECT_ROOT}"
-"${VENV_DIR}/bin/python" -m compileall -q app.py oem_mcp_client tests
+"${VENV_DIR}/bin/python" -m compileall -q app.py oem_mcp_client scripts tests
 "${VENV_DIR}/bin/python" -m ruff check .
 "${VENV_DIR}/bin/python" -m pytest -q --cov=oem_mcp_client --cov-report=term-missing
 if command -v shellcheck >/dev/null 2>&1; then

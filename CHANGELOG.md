@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2 - 2026-09-01
+
+- Add a standard-library OCI Generative AI API-key diagnostic that validates endpoint values, protects secrets, bypasses proxies on demand, and distinguishes HTML gateway responses from OCI JSON errors.
+- Correct the recommended Frankfurt API-key endpoint and document both the project-free regional API-key route and the project-based OpenAI-compatible route.
+- Expand the debugging runbook for IAM, API-key secrets, model availability, proxy/egress checks, direct tests, and HTTP response interpretation.
+- Strengthen the operational disclaimer for diagnostics, credentials, model output, costs, and production use.
+
 ## 1.1.1 - 2026-09-01
 
 - Document the complete Frankfurt Generative AI API-key workflow, including project creation, regional key creation, specific-key IAM policy, protected secret storage, and validation.
